@@ -8,6 +8,12 @@ from sentence_transformers import SentenceTransformer
 _model = None
 _model_load_error = None
 
+# 当前使用的 embedding 模型
+# 备选: "BAAI/bge-large-zh-v1.5" (1024 token, 中文专用, 需要 sentence-transformers>=3.0 且 transformers 兼容)
+EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+# BGE 模型检索任务 instruction 前缀（仅 BGE 模型使用）
+BGE_RETRIEVAL_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+
 
 def get_model():
     """获取 embedding 模型实例，带异常处理和友好提示"""
@@ -19,12 +25,11 @@ def get_model():
     if _model_load_error is not None:
         raise _model_load_error
 
-    model_name = "paraphrase-multilingual-MiniLM-L12-v2"
     try:
-        print(f"[Embedding] 正在加载模型 {model_name}，首次加载可能需要下载...")
+        print(f"[Embedding] 正在加载模型 {EMBEDDING_MODEL_NAME}，首次加载可能需要下载...")
         print("[Embedding] 下载源: https://hf-mirror.com")
-        _model = SentenceTransformer(model_name)
-        print("[Embedding] 模型加载完成！")
+        _model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        print(f"[Embedding] 模型加载完成！最大序列长度: {_model.max_seq_length}")
     except Exception as e:
         _model_load_error = RuntimeError(
             f"Embedding 模型加载失败: {e}\n"
@@ -36,13 +41,24 @@ def get_model():
 
 
 def generate_embedding(text: str) -> list[float]:
-    """生成文本的向量嵌入"""
+    """生成文本的向量嵌入（文档文本）"""
     try:
         model = get_model()
         embedding = model.encode(text)
         return embedding.tolist()
     except Exception as e:
         print(f"[Embedding] 生成 embedding 失败: {e}", file=sys.stderr)
+        raise
+
+
+def generate_query_embedding(question: str) -> list[float]:
+    """生成查询向量（语义检索用）"""
+    try:
+        model = get_model()
+        embedding = model.encode(question)
+        return embedding.tolist()
+    except Exception as e:
+        print(f"[Embedding] 生成查询 embedding 失败: {e}", file=sys.stderr)
         raise
 
 

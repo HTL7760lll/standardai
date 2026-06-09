@@ -42,7 +42,7 @@ async def upload_document(file: UploadFile = File(...),
     if filepath is None:
         raise HTTPException(status_code=400, detail="只能上传 .pdf、.docx、.txt 类型的文件")
     try :
-        new_document = services.document_service.loading_information(db,file.filename,filepath,standard_type,industry,tags)
+        new_document = services.document_service.create_document(db,file.filename,standard_type,industry,tags,filepath)
         if new_document is None:
             raise HTTPException(status_code=500, detail="上传标准文件失败")
 
@@ -104,6 +104,9 @@ async def upload_document(file: UploadFile = File(...),
         return {
             "message": "上传标准文件成功",
             "document": new_document,
+            "document_type": services.document_service._classify_document_type(
+                text or "", file.filename or ""
+            ) if text else "unknown",
             "auto_chunk": chunk_result,
             "chunk_error": chunk_error,
         }
@@ -168,6 +171,75 @@ def _generate_follow_ups(question: str, intent: str, references: list[dict]) -> 
     return follow_ups[:3]
 
 
+# ═══════════════════════════════════════════════════════════════
+# 共享引用构建（/ask 和 /ask/stream 共用）
+# ═══════════════════════════════════════════════════════════════
+
+_CHUNK_TYPE_CN = {
+    "cover": "封面", "preface": "前言/引言", "scope": "范围",
+    "references": "规范性引用文件", "term": "术语定义", "clause": "正文条款",
+    "table": "表格", "figure": "图示/公式", "appendix": "附录",
+}
+
+
+def _build_references(db, results, expanded_results):
+    """从检索结果构建 references 列表（去重 + 评分 + 截断 + 来源标签）"""
+    direct_ids = {item["chunk"].id for item in results}
+    direct_scores = {item["chunk"].id: item["score"] for item in results}
+    direct_match_types = {item["chunk"].id: item["match_type"] for item in results}
+
+    references = []
+    for chunk in expanded_results:
+        doc = services.document_service.get_document_by_id(db, chunk.document_id)
+
+        if chunk.id in direct_ids:
+            mt = direct_match_types.get(chunk.id, "linked")
+            references.append(_make_ref(chunk, doc,
+                score=direct_scores.get(chunk.id, 0.0),
+                match_type=mt,
+                source_label="直接命中",
+                priority=0 if mt in ("keyword", "hybrid") else 1))
+        else:
+            is_parent = any(item["chunk"].parent_chunk_id == chunk.id for item in results)
+            is_child = any(chunk.parent_chunk_id and chunk.parent_chunk_id == item["chunk"].id for item in results)
+            if is_parent:
+                references.append(_make_ref(chunk, doc, score=0.0, match_type="linked",
+                    source_label="关联上下文-父级", priority=2))
+            elif is_child:
+                references.append(_make_ref(chunk, doc, score=0.0, match_type="linked",
+                    source_label="关联上下文-子级", priority=3))
+            else:
+                references.append(_make_ref(chunk, doc, score=0.0, match_type="linked",
+                    source_label="关联上下文", priority=2))
+
+    references.sort(key=lambda r: (r["priority"], -r["score"]))
+    return references
+
+
+def _make_ref(chunk, doc, score, match_type, source_label, priority):
+    """构建单个 reference 条目"""
+    raw = chunk.content or ""
+    clean = services.document_service._strip_chunk_prefix(raw)
+    limit = 800 if chunk.chunk_type == "table" else 1000
+    if len(clean) > limit:
+        clean = clean[:limit] + "\n[...内容过长，已截断...]"
+    return {
+        "document_id": chunk.document_id,
+        "filename": doc.filename if doc else None,
+        "chunk_index": chunk.chunk_index,
+        "chunk_type": chunk.chunk_type,
+        "chunk_type_cn": _CHUNK_TYPE_CN.get(chunk.chunk_type, chunk.chunk_type or "未知"),
+        "section_path": chunk.section_path,
+        "page_number": chunk.page_number,
+        "score": score,
+        "content": clean,
+        "content_length": len(raw),
+        "match_type": match_type,
+        "source_label": source_label,
+        "priority": priority,
+    }
+
+
 @router.post("/ask")
 def ask(request:AskQuestion,db: Session = Depends(get_db)):
     # 自动文档匹配：如果用户未手动限定文档，尝试从问题中识别文档名
@@ -178,103 +250,73 @@ def ask(request:AskQuestion,db: Session = Depends(get_db)):
         if effective_doc_id is not None:
             auto_matched_doc = services.document_service.get_document_by_id(db, effective_doc_id)
 
-    results = services.document_service.hybrid_search_chunks(db,request.question,request.limit,document_id=effective_doc_id)
+    results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
+        db, request.question, request.limit, document_id=effective_doc_id
+    )
 
     # 自动匹配回退：如果限定文档无结果，回退到全库搜索
     auto_match_fallback = False
     if len(results) == 0 and effective_doc_id is not None and request.document_id is None:
         auto_match_fallback = True
-        effective_doc_id = None  # 回退：取消文档限定
-        # 注意：保留 auto_matched_doc 以告知前端曾经匹配了哪个文档
-        results = services.document_service.hybrid_search_chunks(db,request.question,request.limit,document_id=None)
+        effective_doc_id = None
+        results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
+            db, request.question, request.limit, document_id=None
+        )
+
+    # 零结果查询扩展：用简化查询重试一次
+    if len(results) == 0:
+        expanded_q = services.document_service._expand_query_synonyms(request.question)
+        if expanded_q != request.question:
+            results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
+                db, expanded_q, request.limit, document_id=effective_doc_id
+            )
 
     search_terms = services.document_service.extract_search_terms(request.question)
     question_intent = services.document_service.infer_question_intent(request.question)
 
-    # 联动检索：命中 chunk → 连带父子
+    # 联动检索 + 引用构建
     expanded_results = services.document_service.expand_search_results(db, results, depth=1)
-
-    # 收集直接命中的 chunk ID
-    direct_ids = set()
-    direct_scores = {}
-    direct_match_types = {}
-    for item in results:
-        cid = item["chunk"].id
-        direct_ids.add(cid)
-        direct_scores[cid] = item["score"]
-        direct_match_types[cid] = item["match_type"]
-
-    # chunk 类型中文标签
-    _CHUNK_TYPE_CN = {
-        "cover": "封面", "preface": "前言/引言", "scope": "范围",
-        "references": "规范性引用文件", "term": "术语定义", "clause": "正文条款",
-        "table": "表格", "figure": "图示/公式", "appendix": "附录",
-    }
-
-    references = []
-    for chunk in expanded_results:
-        doc = services.document_service.get_document_by_id(db, chunk.document_id)
-
-        if chunk.id in direct_ids:
-            source_label = "直接命中"
-            score = direct_scores.get(chunk.id, 0.0)
-            match_type = direct_match_types.get(chunk.id, "linked")
-            priority = 0 if match_type in ("keyword", "hybrid") else 1
-        else:
-            # 判断是父级还是子级
-            is_parent = False
-            is_child = False
-            for item in results:
-                if item["chunk"].parent_chunk_id == chunk.id:
-                    is_parent = True
-                if chunk.parent_chunk_id and chunk.parent_chunk_id == item["chunk"].id:
-                    is_child = True
-
-            if is_parent:
-                source_label = "关联上下文-父级"
-                priority = 2
-            elif is_child:
-                source_label = "关联上下文-子级"
-                priority = 3
-            else:
-                source_label = "关联上下文"
-                priority = 2
-            score = 0.0
-            match_type = "linked"
-
-        # 获取内容：去掉内置前缀避免重复
-        raw_content = chunk.content or ""
-        clean_content = services.document_service._strip_chunk_prefix(raw_content)
-        # 表格类截断到 800 字，其余 1000 字封顶
-        if chunk.chunk_type == "table" and len(clean_content) > 800:
-            clean_content = clean_content[:800] + "\n[...表格过长，已截断...]"
-        elif len(clean_content) > 1000:
-            clean_content = clean_content[:1000] + "\n[...内容过长，已截断...]"
-
-        references.append({
-            "document_id": chunk.document_id,
-            "filename": doc.filename if doc else None,
-            "chunk_index": chunk.chunk_index,
-            "chunk_type": chunk.chunk_type,
-            "chunk_type_cn": _CHUNK_TYPE_CN.get(chunk.chunk_type, chunk.chunk_type or "未知"),
-            "section_path": chunk.section_path,
-            "page_number": chunk.page_number,
-            "score": score,
-            "content": clean_content,
-            "content_length": len(raw_content),
-            "match_type": match_type,
-            "source_label": source_label,
-            "priority": priority,
-        })
-
-    # 按优先级排序：直接关键词 > 直接语义 > 关联父级 > 关联子级
-    references.sort(key=lambda r: (r["priority"], -r["score"]))
+    references = _build_references(db, results, expanded_results)
 
     if len(references) == 0:
         return {
             "question": request.question,
             "answer": "没有找到相关参考资料，暂时无法回答。请确认：1) 已上传标准文件 2) 已为该文件生成切片。",
             "references": [],
+            "retrieval_confidence": "none",
+            "confidence_detail": confidence_detail,
+            "auto_matched_document": {
+                "document_id": auto_matched_doc.id,
+                "filename": auto_matched_doc.filename,
+            } if auto_matched_doc else None,
+            "auto_match_fallback": auto_match_fallback,
+            "prompt_preview": None,
+        }
+
+    # 低置信度检索 → 直接返回提示，不传 LLM（过滤掉不可信结果）
+    if confidence == "low":
+        return {
+            "question": request.question,
+            "answer": (
+                "检索结果可信度较低，未找到与问题高度匹配的内容。"
+                "建议：1) 尝试使用更具体的术语提问 2) 确认相关标准文件已上传并生成切片 3) 尝试引用标准编号查询。"
+            ),
+            "references": [{
+                "document_id": r["document_id"],
+                "filename": r["filename"],
+                "chunk_index": r["chunk_index"],
+                "chunk_type": r["chunk_type"],
+                "chunk_type_cn": _CHUNK_TYPE_CN.get(r["chunk_type"], r["chunk_type"] or "未知"),
+                "section_path": r["section_path"],
+                "page_number": r["page_number"],
+                "score": r["score"],
+                "content_preview": r["content"][:300],
+                "content_length": r["content_length"],
+                "match_type": r["match_type"],
+                "source_label": r["source_label"],
+            } for r in references],
+            "retrieval_confidence": "low",
+            "confidence_detail": confidence_detail,
             "auto_matched_document": {
                 "document_id": auto_matched_doc.id,
                 "filename": auto_matched_doc.filename,
@@ -386,6 +428,8 @@ def ask(request:AskQuestion,db: Session = Depends(get_db)):
         } for r in references],
         "follow_up_questions": follow_up_questions,
         "recommendations": recommendations,
+        "retrieval_confidence": confidence,
+        "confidence_detail": confidence_detail,
         "auto_matched_document": {
             "document_id": auto_matched_doc.id,
             "filename": auto_matched_doc.filename,
@@ -410,7 +454,7 @@ async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
             auto_matched_doc = services.document_service.get_document_by_id(db, effective_doc_id)
 
     # ── 1. 检索阶段（同步，和 /ask 逻辑一致）──
-    results = services.document_service.hybrid_search_chunks(
+    results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
         db, request.question, request.limit, document_id=effective_doc_id
     )
 
@@ -418,94 +462,34 @@ async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
     auto_match_fallback = False
     if len(results) == 0 and effective_doc_id is not None and request.document_id is None:
         auto_match_fallback = True
-        effective_doc_id = None  # 回退：取消文档限定
-        # 注意：保留 auto_matched_doc 以告知前端曾经匹配了哪个文档
-        results = services.document_service.hybrid_search_chunks(
+        effective_doc_id = None
+        results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
             db, request.question, request.limit, document_id=None
         )
+
+    # 零结果查询扩展
+    if len(results) == 0:
+        expanded_q = services.document_service._expand_query_synonyms(request.question)
+        if expanded_q != request.question:
+            results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
+                db, expanded_q, request.limit, document_id=effective_doc_id
+            )
 
     search_terms = services.document_service.extract_search_terms(request.question)
     question_intent = services.document_service.infer_question_intent(request.question)
     expanded_results = services.document_service.expand_search_results(db, results, depth=1)
 
-    # 收集直接命中信息
-    direct_ids = set()
-    direct_scores = {}
-    direct_match_types = {}
-    for item in results:
-        cid = item["chunk"].id
-        direct_ids.add(cid)
-        direct_scores[cid] = item["score"]
-        direct_match_types[cid] = item["match_type"]
-
-    _CHUNK_TYPE_CN = {
-        "cover": "封面", "preface": "前言/引言", "scope": "范围",
-        "references": "规范性引用文件", "term": "术语定义", "clause": "正文条款",
-        "table": "表格", "figure": "图示/公式", "appendix": "附录",
-    }
-
-    # 组装 references
-    references = []
-    for chunk in expanded_results:
-        doc = services.document_service.get_document_by_id(db, chunk.document_id)
-        if chunk.id in direct_ids:
-            source_label = "直接命中"
-            score = direct_scores.get(chunk.id, 0.0)
-            match_type = direct_match_types.get(chunk.id, "linked")
-            priority = 0 if match_type in ("keyword", "hybrid") else 1
-        else:
-            is_parent = False
-            is_child = False
-            for item in results:
-                if item["chunk"].parent_chunk_id == chunk.id:
-                    is_parent = True
-                if chunk.parent_chunk_id and chunk.parent_chunk_id == item["chunk"].id:
-                    is_child = True
-            if is_parent:
-                source_label = "关联上下文-父级"
-                priority = 2
-            elif is_child:
-                source_label = "关联上下文-子级"
-                priority = 3
-            else:
-                source_label = "关联上下文"
-                priority = 2
-            score = 0.0
-            match_type = "linked"
-
-        raw_content = chunk.content or ""
-        clean_content = services.document_service._strip_chunk_prefix(raw_content)
-        if chunk.chunk_type == "table" and len(clean_content) > 800:
-            clean_content = clean_content[:800] + "\n[...表格过长，已截断...]"
-        elif len(clean_content) > 1000:
-            clean_content = clean_content[:1000] + "\n[...内容过长，已截断...]"
-
-        references.append({
-            "document_id": chunk.document_id,
-            "filename": doc.filename if doc else None,
-            "chunk_index": chunk.chunk_index,
-            "chunk_type": chunk.chunk_type,
-            "chunk_type_cn": _CHUNK_TYPE_CN.get(chunk.chunk_type, chunk.chunk_type or "未知"),
-            "section_path": chunk.section_path,
-            "page_number": chunk.page_number,
-            "score": score,
-            "content": clean_content,
-            "content_length": len(raw_content),
-            "match_type": match_type,
-            "source_label": source_label,
-            "priority": priority,
-        })
-
-    references.sort(key=lambda r: (r["priority"], -r["score"]))
+    # 引用构建
+    references = _build_references(db, results, expanded_results)
 
     if len(references) == 0:
-        # 无资料时也走流式返回，包含自动匹配信息
         async def empty_stream():
             yield "data: {}\n\n".format(json.dumps({
                 "type": "meta",
                 "references": [],
                 "recommendations": None,
                 "follow_up_questions": [],
+                "retrieval_confidence": "none",
                 "auto_matched_document": {
                     "document_id": auto_matched_doc.id,
                     "filename": auto_matched_doc.filename,
@@ -519,6 +503,46 @@ async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
             yield "data: {}\n\n".format(json.dumps({"type": "done"}))
 
         return StreamingResponse(empty_stream(), media_type="text/event-stream")
+
+    # 低置信度检索 → SSE 返回提示
+    if confidence == "low":
+        async def low_conf_stream():
+            yield "data: {}\n\n".format(json.dumps({
+                "type": "meta",
+                "references": [{
+                    "document_id": r["document_id"],
+                    "filename": r["filename"],
+                    "chunk_index": r["chunk_index"],
+                    "chunk_type": r["chunk_type"],
+                    "chunk_type_cn": _CHUNK_TYPE_CN.get(r["chunk_type"], r["chunk_type"] or "未知"),
+                    "section_path": r["section_path"],
+                    "page_number": r["page_number"],
+                    "score": r["score"],
+                    "content_preview": r["content"][:300],
+                    "content_length": r["content_length"],
+                    "match_type": r["match_type"],
+                    "source_label": r["source_label"],
+                } for r in references],
+                "recommendations": None,
+                "follow_up_questions": [],
+                "retrieval_confidence": "low",
+                "confidence_detail": confidence_detail,
+                "auto_matched_document": {
+                    "document_id": auto_matched_doc.id,
+                    "filename": auto_matched_doc.filename,
+                } if auto_matched_doc else None,
+                "auto_match_fallback": auto_match_fallback,
+            }, ensure_ascii=False))
+            yield "data: {}\n\n".format(json.dumps({
+                "type": "answer",
+                "content": (
+                    "检索结果可信度较低，未找到与问题高度匹配的内容。"
+                    "建议：1) 尝试使用更具体的术语提问 2) 确认相关标准文件已上传并生成切片 3) 尝试引用标准编号查询。"
+                ),
+            }, ensure_ascii=False))
+            yield "data: {}\n\n".format(json.dumps({"type": "done"}))
+
+        return StreamingResponse(low_conf_stream(), media_type="text/event-stream")
 
     # ── 2. 构建 context 和 prompt ──
     context_parts = []
@@ -611,6 +635,8 @@ async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
             } for r in references],
             "recommendations": recommendations,
             "follow_up_questions": follow_up_questions,
+            "retrieval_confidence": confidence,
+            "confidence_detail": confidence_detail,
             "auto_matched_document": {
                 "document_id": auto_matched_doc.id,
                 "filename": auto_matched_doc.filename,
@@ -712,7 +738,7 @@ async def update_document_by_id(document_id: int, patch_document: DocumentUpdate
     document = services.document_service.get_document_by_id(db,document_id)
     if document is None:
         raise HTTPException(status_code=404, detail="您要修改的标准文件不存在")
-    existing_document = services.document_service.patch_document_filename(db,patch_document.filename)
+    existing_document = services.document_service.find_document(db, patch_document.filename)
     if existing_document is not None and existing_document.id != document_id:
         raise HTTPException(status_code=409, detail="标准文件已存在")
     document = services.document_service.patch_document(
@@ -742,7 +768,7 @@ async def delete_document_by_id(document_id: int,
 
 @router.get("/documents/{document_id}/download")
 async def download_document(document_id: int,db: Session = Depends(get_db)):
-    document = services.document_service.download_document(db,document_id)
+    document = services.document_service.get_document_by_id(db,document_id)
     if document is None:
         raise HTTPException(status_code=404,detail="您要的标准文件不存在")
     path = document.filepath
@@ -788,9 +814,10 @@ async def chunk_documents(document_id: int,db: Session = Depends(get_db)):
         type_counts[ct] = type_counts.get(ct, 0) + 1
 
     return {
-        "message": "文档切片预览成功（v2 结构感知切片）",
+        "message": "文档切片预览成功（v3 分类感知切片）",
         "document_id": document.id,
         "filename": document.filename,
+        "document_type": services.document_service._classify_document_type(text, document.filename or ""),
         "total_chunks": len(chunks_v2),
         "chunk_types": type_counts,
     }

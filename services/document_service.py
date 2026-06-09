@@ -1,4 +1,10 @@
 
+# ═══ 必须在所有 Paddle 相关 import 之前禁用 oneDNN ═══
+import os
+os.environ["FLAGS_use_onednn"] = "0"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# ════════════════════════════════════════════════════════
+
 from sqlalchemy.exc import SQLAlchemyError
 from models import Document, DocumentChunk
 from pathlib import Path
@@ -15,6 +21,7 @@ from docx import Document as DocxDocument
 # OCR 相关（懒加载，避免启动时就加载大模型）
 _fitz = None
 _paddleocr_engine = None
+_ocr_degraded = False  # 标记 OCR 是否已降级
 
 def _get_fitz():
     """懒加载 PyMuPDF (fitz)，避免启动时加载"""
@@ -25,11 +32,32 @@ def _get_fitz():
     return _fitz
 
 def _get_paddleocr():
-    """懒加载 PaddleOCR 引擎"""
-    global _paddleocr_engine
-    if _paddleocr_engine is None:
-        from paddleocr import PaddleOCR
-        _paddleocr_engine = PaddleOCR(lang='ch', use_angle_cls=True)
+    """
+    懒加载 PaddleOCR 引擎（线程安全）。
+    oneDNN 已在模块级别通过环境变量 FLAGS_use_onednn=0 禁用。
+    KMP_DUPLICATE_LIB_OK=TRUE 防止 Windows 下 OpenMP 冲突。
+    """
+    global _paddleocr_engine, _ocr_degraded
+    import threading
+
+    # 双重检查锁定，防止 4 个 OCR 工作线程同时初始化导致 segfault
+    if _paddleocr_engine is None and not _ocr_degraded:
+        # 使用模块级锁
+        lock_attr = '_paddleocr_init_lock'
+        if not hasattr(_get_paddleocr, lock_attr):
+            setattr(_get_paddleocr, lock_attr, threading.Lock())
+        lock = getattr(_get_paddleocr, lock_attr)
+
+        with lock:
+            if _paddleocr_engine is None:  # 双重检查
+                try:
+                    from paddleocr import PaddleOCR
+                    _paddleocr_engine = PaddleOCR(lang='ch', use_angle_cls=True)
+                    print("[OCR] PaddleOCR 引擎初始化完成")
+                except Exception as e:
+                    print(f"[OCR] PaddleOCR 初始化失败: {e}，将禁用 OCR 功能")
+                    _ocr_degraded = True
+                    _paddleocr_engine = None
     return _paddleocr_engine
 
 # jieba 分词
@@ -51,11 +79,14 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 def _is_text_garbled(text: str) -> bool:
     """
-    检测文本是否为乱码。
+    检测文本是否为乱码（增强版 v2）。
     判断标准：
     1. 文本为空 → True
-    2. 有意义字符（中文+英文+数字）占比 < 20% → True
+    2. 有意义字符（中文+英文+数字）占比 < 40% → True（从 20% 提升）
     3. 中文字符占比极低（< 5%）且无英文单词 → True
+    4. 纯数字/符号表格（数字占比 > 30%）→ False，不是乱码
+    5. 连续无效字符序列 > 40 → True（段落级乱码检测）
+    6. 伪 CJK 字符占比检测（GBK 双重编码等产生的高码点字符）→ True
     """
     if not text or text.strip() == "":
         return True
@@ -67,21 +98,50 @@ def _is_text_garbled(text: str) -> bool:
     english_alpha = 0
     digit = 0
     whitespace = 0
+    # 新增统计
+    pseudo_cjk = 0       # 伪 CJK 字符（CJK 扩展 B+ 区，实际文本中极少出现）
+    consecutive_invalid = 0  # 连续无效字符计数
+    max_consecutive_invalid = 0
+
+    # 合法的常见标点符号（中文+英文）
+    valid_punctuation = set(
+        '，。！？；：""''（）【】《》、…—\n\r\t　'
+        ',.!?;:\'\"()[]{}<>/-_=+@#$%^&*|\\~`'
+        '·•·∙※←→↑↓↔↵✓✗✘□■○●◇◆△▲☆★▷▶▸►'
+        '①②③④⑤⑥⑦⑧⑨⑩ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ'
+    )
 
     for ch in text:
         cp = ord(ch)
         # 中文字符范围（含 CJK 统一汉字、扩展 A-F、兼容汉字）
-        if (0x4E00 <= cp <= 0x9FFF or      # CJK 统一汉字
-            0x3400 <= cp <= 0x4DBF or      # CJK 扩展 A
-            0x20000 <= cp <= 0x2A6DF or    # CJK 扩展 B
-            0xF900 <= cp <= 0xFAFF):       # CJK 兼容汉字
+        if (0x4E00 <= cp <= 0x9FFF or      # CJK 统一汉字 (常用)
+            0x3400 <= cp <= 0x4DBF):       # CJK 扩展 A
             chinese += 1
+            consecutive_invalid = 0
+        elif (0xF900 <= cp <= 0xFAFF):     # CJK 兼容汉字
+            chinese += 1
+            consecutive_invalid = 0
+        elif (0x20000 <= cp <= 0x2A6DF):   # CJK 扩展 B (极少使用，可能是伪字符)
+            pseudo_cjk += 1
+            consecutive_invalid = 0
         elif ('a' <= ch.lower() <= 'z'):
             english_alpha += 1
+            consecutive_invalid = 0
         elif ('0' <= ch <= '9'):
             digit += 1
+            consecutive_invalid = 0
         elif ch in ' \n\r\t　':
             whitespace += 1
+            # 空白不重置 consecutive_invalid，也不累加
+            continue
+        elif ch in valid_punctuation:
+            # 标点不算乱码但也不累加连续计数
+            consecutive_invalid = 0
+        else:
+            # 无法识别的字符 → 可能是乱码
+            consecutive_invalid += 1
+            if consecutive_invalid > max_consecutive_invalid:
+                max_consecutive_invalid = consecutive_invalid
 
     meaningful = chinese + english_alpha + digit
     non_whitespace = total - whitespace
@@ -95,18 +155,60 @@ def _is_text_garbled(text: str) -> bool:
     # 中文占比
     chinese_ratio = chinese / non_whitespace
 
-    # 判断条件:
-    # 1. 有意义字符 < 20% → 乱码
-    if meaningful_ratio < 0.20:
+    # 数字占比
+    digit_ratio = digit / non_whitespace
+
+    # 伪 CJK 占比
+    pseudo_cjk_ratio = pseudo_cjk / non_whitespace
+
+    # ── 判断条件 ──
+
+    # 1. 纯数字/符号表格：数字占比 > 30% → 不是乱码（表格数据）
+    #    但如果是 /G21/G22 类编码垃圾模式，即使数字多也是乱码
+    slash_like_codes = len(re.findall(r'/[A-Z]\d{2,}', text))
+    if digit_ratio > 0.30 and slash_like_codes <= 10:
+        return False
+
+    # 2. 有意义字符 < 40%（提升阈值，原来 20% 太宽松）→ 乱码
+    if meaningful_ratio < 0.40:
         return True
 
-    # 2. 既无中文也无英文 → 乱码 (可能是纯符号或损坏数据)
+    # 3. 既无中文也无英文 → 乱码（纯符号或损坏数据）
     if chinese == 0 and english_alpha == 0:
         return True
 
-    # 3. 有意义字符 < 40% 且中文 < 5% → 乱码
-    if meaningful_ratio < 0.40 and chinese_ratio < 0.05:
+    # 4. 有意义字符 < 50% 且中文 < 5% → 乱码
+    if meaningful_ratio < 0.50 and chinese_ratio < 0.05:
         return True
+
+    # 5. 连续无效字符超过 40 个 → 文本中有大片乱码段
+    if max_consecutive_invalid > 40:
+        return True
+
+    # 6. 伪 CJK 字符占比 > 15%（CJK 扩展 B 区字符大量出现通常是编码错误）
+    if pseudo_cjk_ratio > 0.15:
+        return True
+
+    # 7. 重复垃圾模式检测：/G21/G22/G23 类伪编码
+    #    提取所有连续英文数字串，检查是否几乎都是 "字母+数字" 模式
+    alpha_num_tokens = re.findall(r'[A-Za-z]+\d+|\d+[A-Za-z]+', text)
+    if len(alpha_num_tokens) > 20:
+        # 如果有大量 "字母+数字" token 且中文极少 → 编码垃圾
+        if chinese_ratio < 0.10:
+            return True
+
+    # 8. 可疑重复编码检测：/G21/G22... 模式 + 中文极少 → 垃圾
+    slash_code_pattern = re.findall(r'/[A-Z]\d{2,}', text)
+    if len(slash_code_pattern) > 10 and chinese_ratio < 0.15:
+        return True
+
+    # 9. 超低信息密度：中文 < 3% 且有大量单字母 token → 垃圾
+    if chinese_ratio < 0.03 and english_alpha > 100:
+        en_tokens = re.findall(r'[A-Za-z]+', text)
+        if en_tokens:
+            avg_len = sum(len(t) for t in en_tokens) / len(en_tokens)
+            if avg_len < 2.5:
+                return True
 
     return False
 
@@ -119,12 +221,21 @@ def _ocr_pdf_with_paddle(file_path: str) -> str:
     - OCR 结果写入 ocr_result_cache 表，相同页面复用
     """
     import hashlib
+    import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     fitz = _get_fitz()
     doc = fitz.open(file_path)
     total_pages = len(doc)
     texts = [None] * total_pages
+
+    # 在主线程中预加载 PaddleOCR（避免 4 个工作线程竞态初始化导致 segfault）
+    _ocr_init_lock = threading.Lock()
+    with _ocr_init_lock:
+        ocr_engine = _get_paddleocr()
+    if ocr_engine is None:
+        doc.close()
+        return ""  # OCR 不可用，返回空
 
     # 尝试连接数据库做缓存
     db_session = None
@@ -222,6 +333,74 @@ def _ocr_pdf_with_paddle(file_path: str) -> str:
     return "\n".join(result_parts)
 
 
+def _ocr_single_image(image_path: str) -> str | None:
+    """
+    对单张图片执行 OCR，返回识别文本。
+    如果 OCR 引擎不可用或识别失败，返回 None。
+    """
+    global _ocr_degraded
+
+    if _ocr_degraded:
+        return None
+
+    ocr = _get_paddleocr()
+    if ocr is None:
+        return None
+
+    try:
+        result = ocr.ocr(image_path)
+        if result and result[0]:
+            parts = [line[1][0] for line in result[0]]
+            return " ".join(parts).strip()
+    except Exception as e:
+        print(f"[OCR] 单图 OCR 失败: {e}")
+        _ocr_degraded = True
+    return None
+
+
+def _extract_docx_images(doc) -> list[str]:
+    """
+    从 DOCX 文档中提取嵌入图片并 OCR。
+    返回 OCR 识别文本列表，每个元素对应一张图片的识别结果。
+    如果无法提取图片或 OCR 不可用，返回空列表。
+    """
+    global _ocr_degraded
+
+    if _ocr_degraded:
+        return []
+
+    ocr = _get_paddleocr()
+    if ocr is None:
+        return []
+
+    image_texts = []
+    try:
+        # 遍历 docx 内部的图片关系
+        for rel in doc.part.rels.values():
+            if "image" in rel.reltype:
+                image_part = rel.target_part
+                image_bytes = image_part.blob
+                # 保存到临时文件
+                suffix = ".png"
+                if hasattr(image_part, 'partname') and image_part.partname:
+                    ext = Path(str(image_part.partname)).suffix.lower()
+                    if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff'):
+                        suffix = ext
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(image_bytes)
+                    tmp_path = tmp.name
+                try:
+                    ocr_text = _ocr_single_image(tmp_path)
+                    if ocr_text:
+                        image_texts.append(ocr_text)
+                finally:
+                    Path(tmp_path).unlink(missing_ok=True)
+    except Exception as e:
+        print(f"[DOCX] 提取嵌入图片失败: {e}")
+
+    return image_texts
+
+
 # ═══════════════════════════════════════════════════════════════
 # 文档 CRUD 函数
 # ═══════════════════════════════════════════════════════════════
@@ -231,10 +410,14 @@ def find_document(db, filename):
     return existing_document
 
 
-def create_document(db, filename, standard_type, industry, tags):
+def create_document(db, filename, standard_type, industry, tags, filepath: str | None = None):
+    """创建文档记录。tags 支持 list[str] 或逗号分隔字符串。"""
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
     try:
         new_document = Document(
             filename=filename,
+            filepath=filepath,
             standard_type=standard_type,
             industry=industry,
             tags=tags,
@@ -262,29 +445,6 @@ async def get_file(file):
     filepath = UPLOAD_DIR / saved_name
     filepath.write_bytes(file_bytes)
     return str(filepath)
-
-
-def loading_information(db, filename, filepath, standard_type, industry, tags):
-    tags_list = []
-    for tag in tags.split(","):
-        clean_tag = tag.strip()
-        if clean_tag != "":
-            tags_list.append(clean_tag)
-    try:
-        new_document = Document(
-            filename=filename,
-            filepath=filepath,
-            standard_type=standard_type,
-            industry=industry,
-            tags=tags_list
-        )
-        db.add(new_document)
-        db.commit()
-        db.refresh(new_document)
-    except SQLAlchemyError:
-        db.rollback()
-        return None
-    return new_document
 
 
 def get_documents(db, filename, standard_type, industry, tag, page, page_size):
@@ -359,18 +519,6 @@ def get_document_by_id(db, document_id: int):
     return document
 
 
-def patch_document_by_id(db, document_id: int):
-    document = db.query(Document).filter(Document.id == document_id).first()
-    return document
-
-
-def patch_document_filename(db, filename):
-    if filename is not None:
-        existing_document = db.query(Document).filter(Document.filename == filename).first()
-        return existing_document
-    return None
-
-
 def patch_document(db, filename, standard_type, industry, tags, document):
     try:
         if filename is not None:
@@ -389,11 +537,6 @@ def patch_document(db, filename, standard_type, industry, tags, document):
     return document
 
 
-def delete_document_by_id(db, document_id: int):
-    document = db.query(Document).filter(Document.id == document_id).first()
-    return document
-
-
 def delete_document(db, d_document):
     try:
         # 级联删除关联的 chunks
@@ -408,11 +551,6 @@ def delete_document(db, d_document):
         db.rollback()
         return False
     return True
-
-
-def download_document(db, document_id: int):
-    document = db.query(Document).filter(Document.id == document_id).first()
-    return document
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -479,9 +617,10 @@ def parse_document(filepath):
     """
     解析上传的文档（.txt / .pdf / .docx），返回纯文本字符串。
     - PDF: 先尝试提取文本层，若文本为空或乱码率过高则自动降级到 PaddleOCR
-    - DOCX: 提取段落 + 表格 + 文本框内容
+    - DOCX: 提取段落 + 表格 + 文本框 + 嵌入图片 OCR
     - TXT: 直接读取
     """
+    global _ocr_degraded
     file_path = Path(filepath)
     suffix = file_path.suffix.lower()
 
@@ -505,6 +644,17 @@ def parse_document(filepath):
         # 检测是否乱码或空文本
         if _is_text_garbled(text):
             print(f"[OCR] PDF 文本层乱码/为空（可读率低），降级到 PaddleOCR: {file_path}")
+
+            # 检查 OCR 引擎是否可用
+            if _ocr_degraded:
+                print("[OCR] OCR 引擎已降级，返回原始文本（可能含乱码），请手动检查")
+                # 返回原始文本但带上警告标记
+                warning = (
+                    "【警告】该 PDF 文本层可能包含乱码，且 OCR 引擎不可用。"
+                    "以下内容仅供参考，建议人工核对原文。\n\n"
+                )
+                return warning + text
+
             try:
                 ocr_text = _ocr_pdf_with_paddle(str(file_path))
                 if ocr_text.strip():
@@ -515,12 +665,15 @@ def parse_document(filepath):
             except Exception as e:
                 print(f"[OCR] PaddleOCR 识别失败: {e}")
                 traceback.print_exc()
+                # 标记 OCR 降级
+                _ocr_degraded = True
 
-            # 文本乱码且 OCR 失败 → 抛出明确错误，不返回乱码
-            raise ValueError(
-                "该 PDF 为扫描件且文本层不可读，自动 OCR 识别失败。"
-                "请确认 PaddleOCR 已正确安装，或尝试转换为文本 PDF 后重新上传。"
+            # 文本乱码且 OCR 失败 → 返回原始文本 + 警告，不抛异常阻塞流程
+            warning = (
+                "【警告】该 PDF 文本层包含乱码且 OCR 识别失败。"
+                "以下内容可能不完整，建议核实原文。\n\n"
             )
+            return warning + text
 
         return text
 
@@ -538,7 +691,7 @@ def parse_document(filepath):
         if paragraph_texts:
             text_parts.append("\n\n".join(paragraph_texts))
 
-        # 2. 提取表格文本（不再拒绝含表格的文档）
+        # 2. 提取表格文本
         table_texts = _extract_docx_tables(doc)
         if table_texts:
             text_parts.extend(table_texts)
@@ -549,11 +702,25 @@ def parse_document(filepath):
             for tb_text in textbox_texts:
                 text_parts.append(f"\n\n===== [文本框] =====\n{tb_text}")
 
+        # 4. 提取嵌入图片并 OCR（兜底：扫描件 DOCX）
+        try:
+            docx_image_texts = _extract_docx_images(doc)
+            if docx_image_texts:
+                for idx, img_text in enumerate(docx_image_texts, start=1):
+                    text_parts.append(f"\n\n===== [文档图片 {idx} OCR] =====\n{img_text}")
+                print(f"[DOCX] 从 {len(docx_image_texts)} 张嵌入图片中 OCR 提取了文本")
+        except Exception as e:
+            print(f"[DOCX] 嵌入图片 OCR 失败（非致命）: {e}")
+
         text = "\n".join(text_parts)
 
-        # 如果全部为空，返回明确提示
+        # 如果全部为空，尝试仅 OCR 图片（完全扫描型 DOCX）
         if text.strip() == "":
-            raise ValueError("文档解析结果为空，可能包含文本框、图片文字或复杂排版内容暂不支持")
+            raise ValueError(
+                "文档解析结果为空。该文档可能为纯扫描图片格式，"
+                "或包含复杂排版（文本框、图片文字）暂不支持。"
+                "建议转换为文本 PDF 或启用 OCR 后重新上传。"
+            )
 
         return text
 
@@ -687,20 +854,25 @@ def _extract_standard_info(text: str, filename: str = "") -> dict:
 
 def _detect_major_sections(text: str) -> list[dict]:
     """
-    检测文档的主要区域边界。
+    检测文档的主要区域边界（增强版 v2 — 三层级联）。
+
+    Layer 1: GB/T 标准格式（1 范围 / 2 规范性引用文件 / 3 术语和定义 / 前言 / 附录 / 参考文献）
+    Layer 2: 通用标题格式（第X章 / X.X 标题 / 一、二、三...）
+    Layer 3: 启发式短行检测（短行 + 后续长段落 → 可能是标题）
+
     返回区域列表，每个区域包含 type / title / start / end。
     """
     lines = text.split('\n')
     sections = []
 
-    # 检测关键行
-    header_patterns = [
-        # (regex, section_type)
+    # ═══ Layer 1: GB/T 标准格式检测 ═══
+    # 注：已移除 \b（中文后 \b 在 Python regex 中不匹配行尾换行符）
+    header_patterns_l1 = [
         (r'^前\s*言\s*$', 'preface'),
         (r'^引\s*言\s*$', 'preface'),
-        (r'^(?:1|一)[\s\.、]+\s*范围\b', 'scope'),
-        (r'^(?:2|二)[\s\.、]+\s*规范性引用文件\b', 'references'),
-        (r'^(?:3|三)[\s\.、]+\s*(?:术语和定义|术语与定义|定义)\b', 'terms'),
+        (r'^(?:1|一)[\s\.、]+\s*范围', 'scope'),
+        (r'^(?:2|二)[\s\.、]+\s*规范性引用文件', 'references'),
+        (r'^(?:3|三)[\s\.、]+\s*(?:术语和定义|术语与定义|定义)', 'terms'),
         (r'^附录\s*[A-Za-z]', 'appendix'),
         (r'^参考文献\s*$', 'references'),
     ]
@@ -711,16 +883,62 @@ def _detect_major_sections(text: str) -> list[dict]:
         line_clean = line.strip()
         if not line_clean:
             continue
-        # 跳过目录行（包含连续5个以上的点或省略号，典型 TOC 格式）
+        # 跳过目录行
         if re.search(r'\.{5,}', line_clean) or re.search(r'…{2,}', line_clean):
             continue
-        # 跳过仅包含编号和省略号的行
         if re.match(r'^[\d\.\s]+$', line_clean):
             continue
-        for pattern, stype in header_patterns:
+        for pattern, stype in header_patterns_l1:
             if re.match(pattern, line_clean):
                 header_positions.append((i, stype, line_clean))
                 break
+
+    # ═══ Layer 2: 通用标题检测（仅当 Layer 1 检测不足时触发）═══
+    if len(header_positions) < 2:
+        # 检测"第X章"、"第X节"
+        generic_chapter = re.compile(r'^第[一二三四五六七八九十百\d]+[章节]')
+
+        for i, line in enumerate(lines):
+            line_clean = line.strip()
+            if not line_clean or len(line_clean) > 80:
+                continue
+            # 检查是否已被 Layer 1 捕获
+            if any(hp[0] == i for hp in header_positions):
+                continue
+            # 模式1: 第X章 / 第X节
+            if generic_chapter.match(line_clean):
+                header_positions.append((i, 'clauses', line_clean))
+                continue
+            # 模式2: 编号标题（如 "1. 绪论"、"1.1 研究背景"、"一、概述"）
+            if re.match(r'^\d+(?:\.\d+)*[\s\.、]+\S', line_clean) and len(line_clean) <= 50:
+                # 确认不是普通数据行（避免将 "2024年3月" 误判）
+                if not re.match(r'^\d{4}[\s 年]', line_clean):
+                    header_positions.append((i, 'clauses', line_clean))
+                    continue
+            # 模式3: 中文序号标题（"一、..." "二、..."）
+            if re.match(r'^[一二三四五六七八九十]+[、．.]\s*\S', line_clean) and len(line_clean) <= 50:
+                header_positions.append((i, 'clauses', line_clean))
+                continue
+
+        # 按行号排序（Layer 2 可能乱序插入）
+        header_positions.sort(key=lambda x: x[0])
+
+    # ═══ Layer 3: 启发式短行检测（仅当仍不足时）═══
+    if len(header_positions) < 2:
+        for i, line in enumerate(lines):
+            line_clean = line.strip()
+            if not line_clean:
+                continue
+            if any(hp[0] == i for hp in header_positions):
+                continue
+            # 短行（5-20 字）且下一行是长段落（> 40 字）→ 可能是标题
+            if 5 <= len(line_clean) <= 20:
+                if i + 1 < len(lines) and len(lines[i + 1].strip()) > 40:
+                    # 不包含句号等句子结束符
+                    if not re.search(r'[。；，！？]', line_clean):
+                        header_positions.append((i, 'clauses', line_clean))
+
+    # ═══ 构建 sections ═══
 
     # 如果没检测到任何标题，整个文档视为 clauses
     if not header_positions:
@@ -733,11 +951,12 @@ def _detect_major_sections(text: str) -> list[dict]:
         })
         return sections
 
-    # 第一个标题之前的内容 → 封面
+    # 第一个标题之前的内容 → 封面（有长度限制）
     first_header_line = header_positions[0][0]
     if first_header_line > 0:
         cover_text = '\n'.join(lines[:first_header_line]).strip()
-        if cover_text and len(cover_text) > 20:
+        # 封面内容不应超过 3000 字（否则可能是漏检的长文档）
+        if cover_text and 20 < len(cover_text) <= 3000:
             sections.append({
                 "type": "cover",
                 "title": "封面",
@@ -745,13 +964,24 @@ def _detect_major_sections(text: str) -> list[dict]:
                 "end_line": first_header_line,
                 "content": cover_text,
             })
+        elif cover_text and len(cover_text) > 3000:
+            # 封面内容太长 → 说明检测不全，退化为 clauses
+            # 清空已有的，把整篇作为正文
+            sections.clear()
+            sections.append({
+                "type": "clauses",
+                "title": "正文",
+                "start_line": 0,
+                "end_line": len(lines),
+                "content": text,
+            })
+            return sections
 
     # 按标题切分区域
     for idx, (line_idx, stype, title) in enumerate(header_positions):
         next_line = header_positions[idx + 1][0] if idx + 1 < len(header_positions) else len(lines)
         section_text = '\n'.join(lines[line_idx:next_line]).strip()
 
-        # 计算区域对应的字符起始位置
         char_start = sum(len(lines[k]) + 1 for k in range(line_idx))
 
         sections.append({
@@ -763,7 +993,7 @@ def _detect_major_sections(text: str) -> list[dict]:
             "content": section_text,
         })
 
-    # 合并相邻同类区域（如"前言"+"引言" → preface）
+    # 合并相邻同类区域
     merged = []
     for sec in sections:
         if merged and merged[-1]["type"] == sec["type"] == "preface":
@@ -776,8 +1006,7 @@ def _detect_major_sections(text: str) -> list[dict]:
         else:
             merged.append(sec)
 
-    # 后处理：检测 "terms" 区域中是否包含正文条款（非3.x的顶级条款号）
-    # 如果包含（如 "4 概述"、"5 技术要求"），拆分为 terms + clauses
+    # 后处理：检测 terms 区域中是否包含正文条款
     processed = []
     for sec in merged:
         if sec.get("type") == "terms":
@@ -785,17 +1014,14 @@ def _detect_major_sections(text: str) -> list[dict]:
             split_at = None
             for j, line in enumerate(sec_lines):
                 line_s = line.strip()
-                # 匹配顶级条款编号（单个数字如 4、5、6，但不是 1.2.3）
                 m = re.match(r'^(\d+)\s+\S', line_s)
                 if m and m.group(1) not in ('1', '2', '3') and len(m.group(1)) <= 2:
                     split_at = j
                     break
             if split_at is not None and split_at > 0:
-                # 拆分：split_at 之前是 terms，之后是 clauses
                 terms_content = '\n'.join(sec_lines[:split_at]).strip()
                 clauses_content = '\n'.join(sec_lines[split_at:]).strip()
                 base_char = sec.get("start_char", 0)
-                # 计算条款部分的大致字符偏移
                 terms_char_len = sum(len(sec_lines[k]) + 1 for k in range(split_at))
                 if terms_content:
                     processed.append({
@@ -1080,10 +1306,19 @@ def _build_chunk_prefix(standard_info: dict, section_path: str = "", page_number
 
 
 def _chunk_cover(sec: dict, std_info: dict, char_to_page: dict) -> list[dict]:
-    """封面 → 1 个 chunk（300-500字），含标准编号/名称"""
+    """
+    封面 → 1 个 chunk（含标准编号/名称）。
+    如果 section 内容超过 2000 字，说明章节检测失败导致正文被误归入封面，
+    此时回退到段落级通用切片。
+    """
     content = sec.get("content", "")
     if not content or len(content.strip()) < 20:
         return []
+
+    # 内容量守卫：封面不应超过 2000 字
+    if len(content) > 2000:
+        print(f"[切片] 封面内容过长 ({len(content)} 字)，回退到段落切片")
+        return _chunk_fallback_paragraphs(content, std_info, char_to_page, "cover")
 
     # 控制在 500 字以内
     text = content[:500].strip()
@@ -1443,82 +1678,365 @@ def _chunk_appendix(sec: dict, std_info: dict, char_to_page: dict) -> list[dict]
     return _chunk_clauses(flat, std_info, char_to_page, char_pos)
 
 
-def smart_split_v2(text: str, filename: str = "") -> list[dict]:
+def _chunk_fallback_paragraphs(
+    text: str,
+    std_info: dict,
+    char_to_page: dict,
+    section_label: str = "正文",
+    target_size: int = 500
+) -> list[dict]:
     """
-    v2 智能文档切片主入口。
-    替代 smart_split_text()，按文档结构和区域类型精准切分。
-    返回 list[dict]，每个 dict 包含 content + 元信息字段。
+    通用段落级兜底切片。
+    按空行切段，相邻短段合并到 target_size 左右。
+    用于章节检测失败时的保障机制，确保文档至少被合理分割。
     """
     if not text or text.strip() == "":
         return []
 
-    # 1. 解析文档结构
-    structure = parse_document_structure(text, filename)
-    std_info = structure.get("standard_info", {})
-    char_to_page = structure.get("char_to_page", {})
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    if not paragraphs:
+        # 无空行 → 按单行切
+        paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
 
-    all_chunks = []
+    if not paragraphs:
+        return []
 
-    # 2. 按区域类型分别切片
-    for sec in structure.get("sections", []):
-        stype = sec.get("type", "")
+    chunks = []
+    i = 0
+    part_num = 1
+    total_estimate = max(1, len(text) // target_size)
 
-        if stype == "cover":
-            all_chunks.extend(_chunk_cover(sec, std_info, char_to_page))
-        elif stype == "preface":
-            all_chunks.extend(_chunk_preface(sec, std_info, char_to_page))
-        elif stype == "scope":
-            all_chunks.extend(_chunk_scope(sec, std_info, char_to_page))
-        elif stype == "references":
-            all_chunks.extend(_chunk_references(sec, std_info, char_to_page))
-        elif stype == "terms":
-            all_chunks.extend(_chunk_terms(sec, std_info, char_to_page))
-        elif stype == "clauses":
-            flat = sec.get("flat_clauses", [])
-            char_pos = sec.get("start_char", 0)
-            page = _get_page_for_position(char_to_page, char_pos)
-            if flat:
-                all_chunks.extend(_chunk_clauses(flat, std_info, char_to_page, char_pos))
+    while i < len(paragraphs):
+        merged = paragraphs[i]
+        j = i + 1
+        while j < len(paragraphs) and len(merged) + len(paragraphs[j]) < target_size:
+            merged += "\n\n" + paragraphs[j]
+            j += 1
+
+        # 估算页码
+        char_pos = sum(len(p) + 2 for p in paragraphs[:i])
+        page = _get_page_for_position(char_to_page, char_pos)
+
+        path = f"{section_label}（{part_num}/{total_estimate}）" if total_estimate > 1 else section_label
+        prefix = _build_chunk_prefix(std_info, path, page)
+        chunks.append({
+            "content": prefix + merged,
+            "chunk_type": "clause",
+            "section_path": path,
+            "section_number": "",
+            "page_number": page,
+        })
+        part_num += 1
+        i = j
+
+    return chunks
+
+
+def _classify_document_type(text: str, filename: str = "") -> str:
+    """
+    文档类型分类器。
+    检查文本前 3000 字 + 文件名，返回类型标签。
+
+    返回:
+      national_standard  — GB, GB/T, GBZ, GJB
+      industry_standard  — NY/T, HJ/T, SN/T, YY/T, DBxx/T 等行业标准
+      enterprise_standard — Q/ 企业标准
+      thesis             — 论文（摘要+Abstract+章节+参考文献特征）
+      generic            — 通用文档
+    """
+    head = text[:3000] if len(text) > 3000 else text
+    std_info = _extract_standard_info(text, filename)
+    std_num = std_info.get("standard_number", "")
+
+    # ── 按标准编号前缀判定 ──
+    # 国家标准
+    if re.search(r'\b(?:GB[ /TZ]|GJB)\s*\d', head, re.IGNORECASE):
+        return "national_standard"
+
+    # 行业标准
+    industry_prefixes = (
+        r'NY[ /T]|HJ[ /T]|SN[ /T]|YY[ /T]|QB[ /T]|'
+        r'DB\d+[ /T]|CJJ|JGJ|GA[ /]|SY[ /T]|DL[ /T]|'
+        r'WS[ /T]|MH[ /T]|JT[ /T]|LS[ /T]|LY[ /T]|SC[ /T]|SB[ /T]|'
+        r'CY[ /T]|JB[ /T]|SJ[ /T]|CB[ /T]|CH[ /T]|CJ[ /T]|'
+        r'GY[ /T]|HY[ /T]|JC[ /T]|JR[ /T]|NB[ /T]|'
+        r'QC[ /T]|QX[ /T]|SH[ /T]|SL[ /T]|'
+        r'TY[ /T]|WB[ /T]|WH[ /T]|YC[ /T]|YZ[ /T]|ZY[ /T]'
+    )
+    if re.search(r'\b(?:' + industry_prefixes + r')\s*\d', head, re.IGNORECASE):
+        return "industry_standard"
+
+    # 企业标准
+    if re.search(r'\bQ/\s*\w', head):
+        return "enterprise_standard"
+
+    # ── 论文检测 ──
+    thesis_signals = 0
+    if re.search(r'摘\s*要|内容提要', head):
+        thesis_signals += 1
+    if re.search(r'\bAbstract\b', head):
+        thesis_signals += 1
+    if re.search(r'第[一二三四五六七八九十\d]+章', head):
+        thesis_signals += 1
+    if re.search(r'参考文献|参考书目', head):
+        thesis_signals += 1
+    if re.search(r'致\s*谢|鸣\s*谢', head):
+        thesis_signals += 1
+    if re.search(r'结\s*论|总\s*结|结束语', head):
+        thesis_signals += 1
+    if re.search(r'毕业论文|学位论文|硕士论文|博士论文|毕业设计', head):
+        thesis_signals += 2
+    if re.search(r'学\s*院[：:]\s*\S|专\s*业[：:]\s*\S|导\s*师[：:]\s*\S|学\s*号[：:]\s*\d', head):
+        thesis_signals += 1
+
+    if thesis_signals >= 3:
+        return "thesis"
+
+    # ── 有编号结构但无标准编号 → 按行业标准处理 ──
+    if re.search(r'\n\d+(?:\.\d+)*\s+\S', head):
+        return "industry_standard"
+
+    return "generic"
+
+
+def _detect_sections_thesis(text: str) -> list[dict]:
+    """
+    论文章节检测。
+    识别：摘要(中/英) → 目录 → 第X章 → 结论 → 参考文献 → 致谢 → 附录
+    """
+    lines = text.split('\n')
+    sections = []
+
+    thesis_patterns = [
+        (r'^摘\s*要\s*$|^内容提要\s*$', 'abstract'),
+        (r'^\s*Abstract\s*$', 'abstract_en'),
+        (r'^目\s*录\s*$|^目\s*次\s*$', 'toc'),
+        (r'^第[一二三四五六七八九十\d]+章', 'chapter'),
+        (r'^结\s*论\s*$|^总\s*结\s*$|^结束语\s*$', 'conclusion'),
+        (r'^参考文献\s*$|^参考书目\s*$', 'references'),
+        (r'^致\s*谢\s*$|^鸣\s*谢\s*$', 'acknowledgment'),
+        (r'^附录\s*[A-Za-z]', 'appendix'),
+    ]
+
+    header_positions = []
+    for i, line in enumerate(lines):
+        line_clean = line.strip()
+        if not line_clean or len(line_clean) > 80:
+            continue
+        # 跳过目录行
+        if re.search(r'\.{5,}', line_clean) or re.search(r'…{2,}', line_clean):
+            continue
+        for pat, stype in thesis_patterns:
+            if re.match(pat, line_clean):
+                header_positions.append((i, stype, line_clean))
+                break
+
+    if not header_positions:
+        sections.append({
+            "type": "clauses", "title": "正文",
+            "start_line": 0, "end_line": len(lines), "content": text,
+        })
+        return sections
+
+    # 封面
+    first_line = header_positions[0][0]
+    if first_line > 0:
+        cover_text = '\n'.join(lines[:first_line]).strip()
+        if 20 < len(cover_text) <= 3000:
+            sections.append({
+                "type": "cover", "title": "封面",
+                "start_line": 0, "end_line": first_line, "content": cover_text,
+            })
+
+    # 切分
+    for idx, (line_idx, stype, title) in enumerate(header_positions):
+        next_line = header_positions[idx + 1][0] if idx + 1 < len(header_positions) else len(lines)
+        sec_text = '\n'.join(lines[line_idx:next_line]).strip()
+        char_start = sum(len(lines[k]) + 1 for k in range(line_idx))
+        sections.append({
+            "type": stype, "title": title,
+            "start_line": line_idx, "end_line": next_line,
+            "start_char": char_start, "content": sec_text,
+        })
+
+    return sections
+
+
+def _build_structure_thesis(text: str, filename: str) -> dict:
+    """为论文构建解析结构，复用 parse_document_structure 的输出格式。"""
+    pages, char_to_page = _map_page_numbers(text)
+    std_info = _extract_standard_info(text, filename)
+    sections = _detect_sections_thesis(text)
+
+    # 对 chapter 类型解析条款树
+    for sec in sections:
+        if sec["type"] == "chapter":
+            sec["clauses"] = _parse_clause_tree(sec["content"])
+            sec["flat_clauses"] = _flatten_clauses(sec["clauses"])
+        elif sec["type"] == "appendix":
+            sec["clauses"] = _parse_clause_tree(sec["content"])
+            label = sec.get("title", "附录")
+            sec["flat_clauses"] = _flatten_clauses(sec["clauses"], label)
+
+    tables = _extract_tables_from_text(text)
+    figures = _extract_figures_from_text(text)
+
+    return {
+        "sections": sections, "standard_info": std_info,
+        "tables": tables, "figures": figures,
+        "pages": pages, "char_to_page": char_to_page,
+    }
+
+
+def smart_split_v2(text: str, filename: str = "") -> list[dict]:
+    """
+    v3 智能文档切片主入口 — 按文档类型分流策略。
+    - national_standard → GB/T 条款层级切片（严格）
+    - industry_standard → 行业标准切片（灵活条款）
+    - enterprise_standard → 企业标准切片（灵活编号）
+    - thesis → 论文章节切片
+    - generic → 语义段落切片（兜底）
+
+    语义保障：每个 chunk 以完整段落/条款为最小单位，绝不在句子中间截断。
+    """
+    if not text or text.strip() == "":
+        return []
+
+    doc_type = _classify_document_type(text, filename)
+
+    # ── national_standard / industry_standard ──
+    if doc_type in ("national_standard", "industry_standard"):
+        struct = parse_document_structure(text, filename)
+        std_info = struct.get("standard_info", {})
+        char_to_page = struct.get("char_to_page", {})
+
+        all_chunks = []
+        for sec in struct.get("sections", []):
+            stype = sec.get("type", "")
+            if stype == "cover":
+                all_chunks.extend(_chunk_cover(sec, std_info, char_to_page))
+            elif stype == "preface":
+                all_chunks.extend(_chunk_preface(sec, std_info, char_to_page))
+            elif stype == "scope":
+                all_chunks.extend(_chunk_scope(sec, std_info, char_to_page))
+            elif stype == "references":
+                all_chunks.extend(_chunk_references(sec, std_info, char_to_page))
+            elif stype == "terms":
+                all_chunks.extend(_chunk_terms(sec, std_info, char_to_page))
+            elif stype == "clauses":
+                flat = sec.get("flat_clauses", [])
+                char_pos = sec.get("start_char", 0)
+                if flat:
+                    all_chunks.extend(_chunk_clauses(flat, std_info, char_to_page, char_pos))
+                else:
+                    content = sec.get("content", "")
+                    if content:
+                        all_chunks.extend(
+                            _chunk_fallback_paragraphs(content, std_info, char_to_page,
+                                                       section_label=sec.get("title", "正文"))
+                        )
+            elif stype == "appendix":
+                all_chunks.extend(_chunk_appendix(sec, std_info, char_to_page))
+
+        all_chunks.extend(_chunk_tables(struct.get("tables", []), std_info, char_to_page))
+        all_chunks.extend(_chunk_figures(struct.get("figures", []), std_info, char_to_page))
+
+        # 兜底保障
+        if not all_chunks:
+            all_chunks = _chunk_fallback_paragraphs(text, std_info, char_to_page, "全文")
+        if len(text.strip()) > 2000 and len(all_chunks) < 3:
+            all_chunks = _chunk_fallback_paragraphs(text, std_info, char_to_page, "全文")
+
+        _assign_parent_refs(all_chunks)
+        return all_chunks
+
+    # ── enterprise_standard ──
+    if doc_type == "enterprise_standard":
+        pages, char_to_page = _map_page_numbers(text)
+        std_info = _extract_standard_info(text, filename)
+        sections = _detect_major_sections(text)
+
+        all_chunks = []
+        for sec in sections:
+            stype = sec.get("type", "")
+            content = sec.get("content", "")
+            if not content:
+                continue
+            if stype == "cover":
+                all_chunks.extend(_chunk_cover(sec, std_info, char_to_page))
+            elif stype == "preface":
+                all_chunks.extend(_chunk_preface(sec, std_info, char_to_page))
+            elif stype in ("clauses", "scope", "references", "terms", "appendix"):
+                flat = sec.get("flat_clauses", []) if "flat_clauses" in sec else _flatten_clauses(_parse_clause_tree(content))
+                char_pos = sec.get("start_char", 0)
+                if flat:
+                    all_chunks.extend(_chunk_clauses(flat, std_info, char_to_page, char_pos))
+                else:
+                    all_chunks.extend(_chunk_fallback_paragraphs(content, std_info, char_to_page, sec.get("title", "正文")))
             else:
-                # 无条款结构，整个内容按段落分块
+                all_chunks.extend(_chunk_fallback_paragraphs(content, std_info, char_to_page, sec.get("title", "正文")))
+
+        tables = _extract_tables_from_text(text)
+        figures = _extract_figures_from_text(text)
+        all_chunks.extend(_chunk_tables(tables, std_info, char_to_page))
+        all_chunks.extend(_chunk_figures(figures, std_info, char_to_page))
+
+        if not all_chunks:
+            all_chunks = _chunk_fallback_paragraphs(text, std_info, char_to_page, "全文")
+        if len(text.strip()) > 2000 and len(all_chunks) < 3:
+            all_chunks = _chunk_fallback_paragraphs(text, std_info, char_to_page, "全文")
+
+        _assign_parent_refs(all_chunks)
+        return all_chunks
+
+    # ── thesis ──
+    if doc_type == "thesis":
+        struct = _build_structure_thesis(text, filename)
+        std_info = struct.get("standard_info", {})
+        char_to_page = struct.get("char_to_page", {})
+
+        all_chunks = []
+        # 论文各类型→chunk 映射
+        type_handlers = {
+            "cover": _chunk_cover,
+            "abstract": lambda s, i, c: _chunk_fallback_paragraphs(s.get("content", ""), i, c, "摘要", 400),
+            "abstract_en": lambda s, i, c: _chunk_fallback_paragraphs(s.get("content", ""), i, c, "Abstract", 400),
+            "chapter": lambda s, i, c: _chunk_clauses(
+                s.get("flat_clauses", []), i, c, s.get("start_char", 0)
+            ) if s.get("flat_clauses") else _chunk_fallback_paragraphs(
+                s.get("content", ""), i, c, s.get("title", "章节")
+            ),
+            "conclusion": lambda s, i, c: _chunk_fallback_paragraphs(s.get("content", ""), i, c, "结论", 500),
+            "references": lambda s, i, c: _chunk_fallback_paragraphs(s.get("content", ""), i, c, "参考文献", 600),
+            "acknowledgment": lambda s, i, c: _chunk_fallback_paragraphs(s.get("content", ""), i, c, "致谢", 400),
+            "appendix": _chunk_appendix,
+        }
+
+        for sec in struct.get("sections", []):
+            stype = sec.get("type", "")
+            handler = type_handlers.get(stype)
+            if handler:
+                all_chunks.extend(handler(sec, std_info, char_to_page))
+            else:
                 content = sec.get("content", "")
                 if content:
-                    prefix = _build_chunk_prefix(std_info, sec.get("title", "正文"), page)
-                    all_chunks.append({
-                        "content": prefix + content.strip(),
-                        "chunk_type": "clause",
-                        "section_path": sec.get("title", "正文"),
-                        "section_number": "",
-                        "page_number": page,
-                    })
-        elif stype == "appendix":
-            all_chunks.extend(_chunk_appendix(sec, std_info, char_to_page))
+                    all_chunks.extend(_chunk_fallback_paragraphs(content, std_info, char_to_page, sec.get("title", "章节")))
 
-    # 3. 表格和图
-    all_chunks.extend(_chunk_tables(structure.get("tables", []), std_info, char_to_page))
-    all_chunks.extend(_chunk_figures(structure.get("figures", []), std_info, char_to_page))
+        all_chunks.extend(_chunk_tables(struct.get("tables", []), std_info, char_to_page))
+        all_chunks.extend(_chunk_figures(struct.get("figures", []), std_info, char_to_page))
 
-    # 4. 如果没有解析出任何 chunk，回退到按段落分块
-    if not all_chunks:
-        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-        i = 0
-        while i < len(paragraphs):
-            merged = paragraphs[i]
-            j = i + 1
-            while j < len(paragraphs) and len(merged) + len(paragraphs[j]) < 500:
-                merged += "\n\n" + paragraphs[j]
-                j += 1
-            all_chunks.append({
-                "content": merged,
-                "chunk_type": "clause",
-                "section_path": "",
-                "section_number": "",
-                "page_number": None,
-            })
-            i = j
+        if not all_chunks:
+            all_chunks = _chunk_fallback_paragraphs(text, std_info, char_to_page, "全文")
+        if len(text.strip()) > 2000 and len(all_chunks) < 3:
+            all_chunks = _chunk_fallback_paragraphs(text, std_info, char_to_page, "全文")
 
-    # 5. 建立父子关系（按 section_path 层级）
-    _assign_parent_refs(all_chunks)
+        _assign_parent_refs(all_chunks)
+        return all_chunks
+
+    # ── generic ──
+    pages, char_to_page = _map_page_numbers(text)
+    std_info = _extract_standard_info(text, filename)
+    all_chunks = _chunk_fallback_paragraphs(text, std_info, char_to_page, "全文")
 
     return all_chunks
 
@@ -1553,100 +2071,6 @@ def _assign_parent_refs(chunks: list[dict]):
                 cur["parent_section_number"] = parent_num
                 cur["parent_chunk_index"] = j
                 break
-
-
-# ═══════════════════════════════════════════════════════════════
-# 智能文本切片 (v1 兼容保留)
-# ═══════════════════════════════════════════════════════════════
-
-def _find_split_boundary(text: str, target: int, search_range: int = 200) -> int:
-    """
-    在 target 位置前后 search_range 范围内寻找最佳切割边界。
-    优先找条款边界（第X条、X.X等），其次段落，再次句子。
-    返回切割位置索引。
-    """
-    start = max(0, target - search_range)
-    end = min(len(text), target + search_range)
-    window = text[start:end]
-
-    # 优先级1: 条款编号边界 (如 "第3条"、"5.2.1"、"3.1 "、"第X章")
-    # 正向匹配：在 target 之后最近的条款开头
-    clause_patterns = [
-        r'\n(?=第[一二三四五六七八九十百\d]+条)',
-        r'\n(?=第[一二三四五六七八九十百\d]+章)',
-        r'\n(?=第[一二三四五六七八九十百\d]+节)',
-        r'\n(?=\d+[\.\s]+)',  # "1. " "3.2 "
-        r'\n(?=\d+\.\d+[\.\s]+)',  # "3.2.1 "
-        r'\n(?=[①②③④⑤⑥⑦⑧⑨⑩])',
-    ]
-
-    for pattern in clause_patterns:
-        for match in re.finditer(pattern, window):
-            abs_pos = start + match.start() + 1  # +1 跳过 \n
-            if abs_pos > target:
-                return abs_pos
-
-    # 优先级2: 段落边界
-    para_match = re.search(r'\n\s*\n', window)
-    if para_match:
-        abs_pos = start + para_match.end()
-        return abs_pos
-
-    # 优先级3: 句子边界
-    sentence_match = re.search(r'[。；！？]\s*', window)
-    if sentence_match:
-        abs_pos = start + sentence_match.end()
-        return abs_pos
-
-    # 兜底: 回到 target 位置，确保不在中文字符中间
-    # 尝试在 target 附近找空格或标点
-    fallback_pattern = re.search(r'[，,、\s]', window)
-    if fallback_pattern:
-        abs_pos = start + fallback_pattern.start()
-        return abs_pos
-
-    return target
-
-
-def smart_split_text(text: str, chunk_size: int = 800, overlap: int = 100) -> list[str]:
-    """
-    语义感知的文本切片。
-    - 优先在条款编号、段落、句子边界处切割
-    - overlap 以完整句子/段落为单位
-    - 保持标准文档的条款结构完整性
-    """
-    if not text or text.strip() == "":
-        return []
-
-    chunks = []
-    start = 0
-
-    while start < len(text):
-        # 目标切割位置
-        end = start + chunk_size
-
-        if end >= len(text):
-            # 最后一段，直接取完
-            chunk = text[start:].strip()
-            if chunk:
-                chunks.append(chunk)
-            break
-
-        # 寻找最佳切割边界
-        split_pos = _find_split_boundary(text, end)
-
-        chunk = text[start:split_pos].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        # 计算下一个 start：overlap 也要对齐边界
-        next_start = split_pos - overlap
-        if next_start <= start:
-            next_start = split_pos  # 防止死循环
-
-        start = next_start
-
-    return chunks
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1741,13 +2165,9 @@ def delete_chunks_by_id(db, document_id: int):
 # 检索函数
 # ═══════════════════════════════════════════════════════════════
 
-def extract_keyword(db, keyword, limit):
-    chunks = db.query(DocumentChunk).filter(DocumentChunk.content.contains(keyword)).limit(limit).all()
-    return chunks
-
-
 def semantic_search_chunks(db, question: str, limit: int = 5, document_id: int | None = None):
-    question_embedding = services.embedding_service.generate_embedding(question)
+    """语义检索：使用 BGE query instruction 前缀增强查询质量"""
+    question_embedding = services.embedding_service.generate_query_embedding(question)
 
     query = db.query(DocumentChunk).filter(
         DocumentChunk.embedding.isnot(None)
@@ -1954,62 +2374,305 @@ def _match_question_to_documents(db, question: str) -> int | None:
     return best_match
 
 
+# ═══════════════════════════════════════════════════════════════
+# IDF 缓存 + 查询扩展
+# ═══════════════════════════════════════════════════════════════
+
+_idf_cache: dict[str, float] | None = None
+_idf_cache_chunk_count: int = 0
+
+
+def _compute_idf_weights(db, force_refresh: bool = False) -> dict[str, float]:
+    """
+    预计算所有 chunk 中词条的 IDF 权重。
+    采用平滑 IDF: log((N + 1) / (df + 1)) + 1
+    结果缓存在 _idf_cache 中，仅当 chunk 数量变化时刷新。
+    """
+    global _idf_cache, _idf_cache_chunk_count
+
+    total_chunks = db.query(DocumentChunk).count()
+    if not force_refresh and _idf_cache is not None and _idf_cache_chunk_count == total_chunks:
+        return _idf_cache
+
+    print(f"[IDF] 重新计算 IDF 权重 ({total_chunks} chunks)...")
+
+    # 遍历所有 chunk 建立文档频率
+    doc_freq: dict[str, int] = {}
+    chunks = db.query(DocumentChunk).all()
+
+    for chunk in chunks:
+        content = chunk.content or ""
+        # 用 jieba 分词
+        words = set(jieba.lcut(content))
+        for w in words:
+            w = w.strip()
+            if len(w) >= 2:
+                doc_freq[w] = doc_freq.get(w, 0) + 1
+
+    N = total_chunks if total_chunks > 0 else 1
+    import math
+    idf = {}
+    for word, df in doc_freq.items():
+        idf[word] = math.log((N + 1) / (df + 1)) + 1  # 平滑 IDF
+
+    # 为未出现的词提供默认 IDF
+    idf["__default__"] = math.log(N + 1) + 1
+
+    _idf_cache = idf
+    _idf_cache_chunk_count = total_chunks
+    print(f"[IDF] IDF 缓存已更新，{len(idf)} 个词条")
+
+    return idf
+
+
+def _expand_query_synonyms(question: str) -> str:
+    """
+    零结果查询扩展：对长查询尝试删除修饰词生成更短的查询。
+    不调用 LLM，纯规则。
+    """
+    # 尝试去掉"是什么""有哪些""如何""怎么"等疑问前缀
+    import re
+    expanded = question
+    # 去掉疑问词
+    expanded = re.sub(r'^(请问|请|一下|什么是|什么叫|有哪些|如何|怎么|能否|可以)', '', expanded).strip()
+    if expanded and expanded != question:
+        return expanded
+    return question
+
+
 def hybrid_search_chunks(db, question: str, limit: int = 5, document_id: int | None = None):
-    """混合检索：关键词 + 语义，按综合相关度排序"""
+    """
+    混合检索 v2：IDF加权关键词 + 语义相似度 + RRF 融合 + 置信度分层。
+    返回 (results, confidence) 元组：
+    - results: list[dict] (和原来格式一致)
+    - confidence: "high" | "medium" | "low"
+    """
     terms = extract_search_terms(question)
+    idf_weights = _compute_idf_weights(db)
+
+    # ── 关键词检索（IDF 加权 + 多因子评分）──
     keyword_chunks = extract_keyword_terms(db, terms, limit * 3, document_id=document_id)
-    semantic_results = semantic_search_chunks(db, question, limit * 3, document_id=document_id)
 
-    result_map = {}
+    # 建立关键词排名（用于 RRF）
+    kw_ranked = {}  # chunk_id -> rank (1-based)
+    kw_scored = {}  # chunk_id -> multi-factor score
 
-    # 关键词命中：根据匹配词数量和特异性计算分数
     for chunk in keyword_chunks:
         content = chunk.content or ""
-        matched_count = 0
-        matched_weight = 0.0
+        matched_terms = []
+        matched_positions = []  # 匹配位置（字符索引）
+        total_idf_bonus = 0.0
+        exact_phrase_match = False
+
         for term in terms:
-            if term and term.strip() and term.strip() in content:
-                matched_count += 1
-                # 长词（>3字）权重更高，短词（1-2字）权重低
-                t_len = len(term.strip())
-                if t_len >= 5:
-                    matched_weight += 1.0
-                elif t_len >= 3:
-                    matched_weight += 0.7
-                else:
-                    matched_weight += 0.3
-        # 关键词分数：0.55-0.85 之间
-        keyword_score = min(0.85, 0.55 + matched_weight * 0.08)
+            term_s = term.strip()
+            if not term_s:
+                continue
+            if term_s in content:
+                matched_terms.append(term_s)
+                # IDF 加权
+                idf = idf_weights.get(term_s, idf_weights.get("__default__", 1.0))
+                total_idf_bonus += min(idf / 10.0, 0.05)  # 归一化到 0~0.05 每词
+                # 记录匹配位置
+                pos = content.find(term_s)
+                matched_positions.append(pos)
 
-        if chunk.id in result_map:
-            result_map[chunk.id]["score"] = max(result_map[chunk.id]["score"], keyword_score)
-            result_map[chunk.id]["match_type"] = "hybrid"
+        if not matched_terms:
+            continue
+
+        # 完整短语命中（问题原文出现在 chunk 中）
+        if question.strip() in content:
+            exact_phrase_match = True
+
+        # 匹配密度
+        match_density = min(1.0, len(matched_terms) / max(1, len(jieba.lcut(content))))
+
+        # 位置加分（前 200 字符内命中 → 标题/首段命中）
+        position_bonus = 0.0
+        if matched_positions:
+            min_pos = min(matched_positions)
+            if min_pos < 200:
+                position_bonus = 0.05
+            elif min_pos < 500:
+                position_bonus = 0.02
+
+        # 多因子评分（0.50 ~ 0.90）
+        keyword_score = (
+            0.50
+            + total_idf_bonus            # IDF 加权 (0 ~ 0.15)
+            + match_density * 0.10       # 匹配密度 (0 ~ 0.10)
+            + position_bonus             # 位置 (0 ~ 0.05)
+            + (0.05 if exact_phrase_match else 0.0)  # 完整短语
+        )
+        keyword_score = min(0.90, max(0.50, keyword_score))
+
+        kw_scored[chunk.id] = {
+            "chunk": chunk,
+            "score": keyword_score,
+            "match_type": "keyword",
+        }
+
+    # 按分数排序给 RRF 排名
+    kw_sorted = sorted(kw_scored.values(), key=lambda x: x["score"], reverse=True)
+    for rank, item in enumerate(kw_sorted, start=1):
+        kw_ranked[item["chunk"].id] = rank
+
+    # ── 语义检索 ──
+    semantic_results = semantic_search_chunks(db, question, limit * 3, document_id=document_id)
+    sem_ranked = {}  # chunk_id -> rank
+    sem_scored = {}  # chunk_id -> item
+
+    for rank, item in enumerate(semantic_results, start=1):
+        cid = item["chunk"].id
+        sem_ranked[cid] = rank
+        sem_scored[cid] = item
+
+    # ── RRF 融合 (k=60) ──
+    K = 60
+    result_map = {}
+
+    all_chunk_ids = set(list(kw_ranked.keys()) + list(sem_ranked.keys()))
+
+    for cid in all_chunk_ids:
+        kw_r = kw_ranked.get(cid)
+        sem_r = sem_ranked.get(cid)
+
+        rrf_score = 0.0
+        if kw_r is not None:
+            rrf_score += 1.0 / (K + kw_r)
+        if sem_r is not None:
+            rrf_score += 1.0 / (K + sem_r)
+
+        # 确定 match_type
+        if kw_r is not None and sem_r is not None:
+            match_type = "hybrid"
+        elif kw_r is not None:
+            match_type = "keyword"
         else:
-            result_map[chunk.id] = {
-                "chunk": chunk,
-                "score": keyword_score,
-                "match_type": "keyword"
-            }
+            match_type = "semantic"
 
-    # 语义命中
-    for item in semantic_results:
-        chunk = item["chunk"]
-        sem_score = item["score"]
-        if chunk.id in result_map:
-            # 同时有关键词和语义命中 → 取较高分，标记为 hybrid
-            result_map[chunk.id]["score"] = max(result_map[chunk.id]["score"], sem_score)
-            result_map[chunk.id]["match_type"] = "hybrid"
+        # 取 chunk 数据
+        if cid in kw_scored:
+            chunk = kw_scored[cid]["chunk"]
         else:
-            result_map[chunk.id] = {
-                "chunk": chunk,
-                "score": sem_score,
-                "match_type": "semantic"
-            }
+            chunk = sem_scored[cid]["chunk"]
 
-    # 纯按分数排序（不区分 keyword/semantic 优先级）
+        # 取最高原始分（用于分数展示）
+        raw_score = 0.0
+        if cid in kw_scored:
+            raw_score = max(raw_score, kw_scored[cid]["score"])
+        if cid in sem_scored:
+            raw_score = max(raw_score, sem_scored[cid]["score"])
+
+        result_map[cid] = {
+            "chunk": chunk,
+            "score": round(rrf_score * 30, 4),  # RRF normalize to 0~1.0 range
+            "raw_score": round(raw_score, 4),
+            "match_type": match_type,
+        }
+
+    # ── 4维加权置信度判定 ──
     results = list(result_map.values())
     results.sort(key=lambda r: r["score"], reverse=True)
-    return results[:limit]
+    top_results = results[:limit]
+
+    if not top_results:
+        return [], "none", {
+            "level": "none", "level_label": "无结果",
+            "score_range": [0, 0], "total_matched": 0, "above_threshold": 0,
+            "match_breakdown": {}, "intent_match": False,
+            "top_section": "", "summary": "未找到任何相关的参考资料"
+        }
+
+    hybrid_count = sum(1 for r in top_results if r["match_type"] == "hybrid")
+    kw_count = sum(1 for r in top_results if r["match_type"] == "keyword")
+    sem_count = sum(1 for r in top_results if r["match_type"] == "semantic")
+    top_score = top_results[0]["score"]
+    scores = [r["score"] for r in top_results[:3]]
+    score_range = [round(min(scores), 2), round(max(scores), 2)]
+
+    # 维度1: 匹配信号强度 (0-1)
+    if hybrid_count >= 2:
+        signal_score = 1.0
+    elif hybrid_count >= 1:
+        signal_score = 0.6
+    elif sem_count >= 1:
+        signal_score = 0.3
+    else:
+        signal_score = 0.2
+
+    # 维度2: 最高分 (0-1, RRF归一化后范围 0~0.98)
+    if top_score >= 0.70:
+        top_score_weight = 1.0
+    elif top_score >= 0.45:
+        top_score_weight = 0.6
+    elif top_score >= 0.30:
+        top_score_weight = 0.3
+    else:
+        top_score_weight = 0.0
+
+    # 维度3: 区分度 (0-1)
+    score_gap = max(scores) - min(scores) if len(scores) >= 2 else 0
+    discrimination = 1.0 if score_gap >= 0.05 else (0.5 if score_gap >= 0.03 else 0.0)
+
+    # 维度4: 意图一致性 (0-1)
+    intent = infer_question_intent(question)
+    intent_match = False
+    top_chunk_type = top_results[0]["chunk"].chunk_type if top_results else None
+    intent_type_map = {
+        "scope": "scope", "definition": "term", "requirement": "clause",
+        "references": "references", "clause_number": "clause",
+    }
+    expected_type = intent_type_map.get(intent)
+    if expected_type and top_chunk_type == expected_type:
+        intent_match = True
+    intent_consistency = 1.0 if intent_match else 0.3
+
+    # 加权总分
+    total_weighted = (
+        signal_score * 0.40 +
+        top_score_weight * 0.30 +
+        discrimination * 0.15 +
+        intent_consistency * 0.15
+    )
+
+    if total_weighted >= 0.70:
+        confidence = "high"
+        level_label = "高可信"
+    elif total_weighted >= 0.40:
+        confidence = "medium"
+        level_label = "中等可信"
+    else:
+        confidence = "low"
+        level_label = "低可信，已过滤"
+
+    top_section = (top_results[0]["chunk"].section_path or "") if top_results else ""
+
+    match_breakdown = {}
+    if hybrid_count: match_breakdown["hybrid"] = hybrid_count
+    if kw_count: match_breakdown["keyword"] = kw_count
+    if sem_count: match_breakdown["semantic"] = sem_count
+
+    if confidence == "high":
+        summary = f"{hybrid_count}个chunk关键词+语义双命中，最高分{top_score:.2f}，检索与问题意图一致"
+    elif confidence == "medium":
+        summary = f"部分命中，最高分{top_score:.2f}，建议确认结果相关性"
+    else:
+        summary = "检索结果可信度低，建议使用更具体的术语或标准编号重新提问"
+
+    confidence_detail = {
+        "level": confidence,
+        "level_label": level_label,
+        "score_range": score_range,
+        "total_matched": len(results),
+        "above_threshold": len(top_results),
+        "match_breakdown": match_breakdown,
+        "intent_match": intent_match,
+        "top_section": top_section,
+        "summary": summary,
+    }
+
+    return top_results, confidence, confidence_detail
 
 
 def expand_search_results(db, matched_chunks: list, depth: int = 1) -> list:
