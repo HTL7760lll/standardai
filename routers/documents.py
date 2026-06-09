@@ -1,0 +1,829 @@
+from fastapi import APIRouter,HTTPException, Query, Depends,UploadFile,File,Form
+from sqlalchemy.exc import SQLAlchemyError
+import services.document_service
+from schemas import (DocumentCreate, DocumentUpdate, DocumentOut, DocumentListResponse,
+                     DocumentMessageOut, MessageOut, DocumentStatsResponse, DocumentSearchResponse, AskQuestion)
+from sqlalchemy.orm import Session
+from database import get_db
+from fastapi.responses import FileResponse, StreamingResponse
+import json
+from pathlib import Path
+import services.llm_service
+import services.anaylysis_service
+import services.watchdog_service
+
+
+router = APIRouter()
+
+@router.post("/documents/manual", response_model=DocumentMessageOut)  # 新增标准文件接口,但是不进行切片分析，只增加文本信息
+async def create_document(document: DocumentCreate, db: Session = Depends(get_db)):
+    existing_document = services.document_service.find_document(db,document.filename)
+    if existing_document is not None:
+        raise HTTPException(status_code=409, detail="标准文件已存在")
+    new_document = services.document_service.create_document(db,document.filename,
+    document.standard_type,document.industry,document.tags)
+    if new_document is None:
+        raise HTTPException(status_code=500, detail="新增标准文件失败")
+    return {"message": "新增标准文件成功",
+            "document": new_document,
+            }
+
+@router.post("/documents/upload", response_model=DocumentMessageOut) #新增标准文件接口，
+async def upload_document(file: UploadFile = File(...),
+                          standard_type:str =Form(...), #Form是普通字段，因为返回的值是普通字段不是JSON
+                          industry:str =Form(...),
+                          tags: str = Form(...),
+                          db: Session = Depends(get_db)):
+
+    existing_document = services.document_service.find_document(db,file.filename)
+    if existing_document is not None:
+        raise HTTPException(status_code=409, detail="标准文件已存在")
+    filepath = await services.document_service.get_file(file)
+    if filepath is None:
+        raise HTTPException(status_code=400, detail="只能上传 .pdf、.docx、.txt 类型的文件")
+    try :
+        new_document = services.document_service.loading_information(db,file.filename,filepath,standard_type,industry,tags)
+        if new_document is None:
+            raise HTTPException(status_code=500, detail="上传标准文件失败")
+
+        # 自动提取标准编号并注册到标准版本追踪
+        # 策略：先尝试从文件名提取，失败则解析文档封面内容
+        std_num = services.document_service._extract_standard_info(
+            file.filename, file.filename
+        ).get("standard_number", "")
+
+        if not std_num:
+            # 文件名提取失败 → 尝试解析文档内容（前 3000 字含封面）
+            try:
+                parsed_text = services.document_service.parse_document(filepath)
+                if parsed_text and len(parsed_text) > 50:
+                    std_info = services.document_service._extract_standard_info(
+                        parsed_text, file.filename
+                    )
+                    std_num = std_info.get("standard_number", "")
+            except Exception:
+                pass  # 解析失败不阻塞上传
+
+        if std_num:
+            services.watchdog_service.register_standard_version(
+                db, new_document.id, std_num, file.filename, source="user_upload"
+            )
+
+        # ── 后端自动切片：上传后立即解析+切片+生成 embedding ──
+        chunk_result = None
+        chunk_error = None
+        try:
+            text = services.document_service.parse_document(filepath)
+            if text and text.strip():
+                chunks_v2 = services.document_service.smart_split_v2(
+                    text, filename=file.filename or ""
+                )
+                # 删除旧 chunks（如有）
+                services.document_service.delete_chunks_by_id(db, new_document.id)
+                # 保存新 chunks（含 embedding 生成）
+                saved = services.document_service.save_document_chunk(
+                    db, chunks_v2, new_document.id
+                )
+                if saved:
+                    type_counts = {}
+                    for c in chunks_v2:
+                        ct = c.get("chunk_type", "unknown") if isinstance(c, dict) else "unknown"
+                        type_counts[ct] = type_counts.get(ct, 0) + 1
+                    chunk_result = {
+                        "total_chunks": len(chunks_v2),
+                        "chunk_types": type_counts,
+                    }
+            else:
+                chunk_error = "文档解析结果为空，可能为扫描件或图片PDF"
+        except ValueError as e:
+            chunk_error = str(e)
+        except Exception as e:
+            chunk_error = f"自动切片失败: {str(e)}"
+            print(f"[上传自动切片] 文档 {file.filename} 切片失败: {e}")
+
+        return {
+            "message": "上传标准文件成功",
+            "document": new_document,
+            "auto_chunk": chunk_result,
+            "chunk_error": chunk_error,
+        }
+
+    except SQLAlchemyError:
+        file_path = Path(filepath)
+        if file_path.exists():
+            file_path.unlink()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 追问建议生成（基于问题意图和检索结果）
+# ═══════════════════════════════════════════════════════════════
+
+def _generate_follow_ups(question: str, intent: str, references: list[dict]) -> list[str]:
+    """
+    根据用户问题和检索到的内容，智能生成 2-3 个追问方向。
+    不调用 LLM，基于规则 + 检索结果推断。
+    """
+    follow_ups = []
+
+    # 从检索结果中提取可追问的条款编号
+    clause_numbers = []
+    for ref in references:
+        sn = ref.get("section_number", "")
+        if sn and sn not in clause_numbers:
+            clause_numbers.append(sn)
+
+    # 基于意图类型生成追问
+    if intent == "references":
+        follow_ups.append("这些引用的标准中，哪些是最核心的？")
+        follow_ups.append("引用的标准是否有版本要求？")
+    elif intent == "clause_number":
+        follow_ups.append("该条款是否有例外或豁免情况？")
+        if clause_numbers:
+            follow_ups.append("与这条相关的上级条款是什么？")
+    elif intent == "scope":
+        follow_ups.append("这份标准适用于哪些具体产品或场景？")
+        if clause_numbers:
+            follow_ups.append("适用范围是否有例外情况？")
+    elif intent == "definition":
+        follow_ups.append("这个术语在实际应用中如何理解？")
+        if clause_numbers:
+            follow_ups.append("相关术语之间有什么区别和联系？")
+    elif intent == "requirement":
+        follow_ups.append("这些要求的具体指标和参数是多少？")
+        if len(clause_numbers) >= 2:
+            follow_ups.append("不同条款之间是否有优先级或冲突？")
+        follow_ups.append("是否有豁免或替代方案？")
+    else:
+        follow_ups.append("能否进一步说明具体条款内容？")
+        if clause_numbers:
+            follow_ups.append("相关条款对实际操作有什么指导意义？")
+        follow_ups.append("这个标准是否引用了其他相关标准？")
+
+    # 如果有关键条款号，追加精准追问
+    if clause_numbers and len(follow_ups) < 3:
+        for cn in clause_numbers[:2]:
+            follow_ups.append("请详细解读第 {} 条款的具体内容".format(cn))
+
+    # 限制 3 个
+    return follow_ups[:3]
+
+
+@router.post("/ask")
+def ask(request:AskQuestion,db: Session = Depends(get_db)):
+    # 自动文档匹配：如果用户未手动限定文档，尝试从问题中识别文档名
+    effective_doc_id = request.document_id
+    auto_matched_doc = None
+    if effective_doc_id is None:
+        effective_doc_id = services.document_service._match_question_to_documents(db, request.question)
+        if effective_doc_id is not None:
+            auto_matched_doc = services.document_service.get_document_by_id(db, effective_doc_id)
+
+    results = services.document_service.hybrid_search_chunks(db,request.question,request.limit,document_id=effective_doc_id)
+
+    # 自动匹配回退：如果限定文档无结果，回退到全库搜索
+    auto_match_fallback = False
+    if len(results) == 0 and effective_doc_id is not None and request.document_id is None:
+        auto_match_fallback = True
+        effective_doc_id = None  # 回退：取消文档限定
+        # 注意：保留 auto_matched_doc 以告知前端曾经匹配了哪个文档
+        results = services.document_service.hybrid_search_chunks(db,request.question,request.limit,document_id=None)
+
+    search_terms = services.document_service.extract_search_terms(request.question)
+    question_intent = services.document_service.infer_question_intent(request.question)
+
+    # 联动检索：命中 chunk → 连带父子
+    expanded_results = services.document_service.expand_search_results(db, results, depth=1)
+
+    # 收集直接命中的 chunk ID
+    direct_ids = set()
+    direct_scores = {}
+    direct_match_types = {}
+    for item in results:
+        cid = item["chunk"].id
+        direct_ids.add(cid)
+        direct_scores[cid] = item["score"]
+        direct_match_types[cid] = item["match_type"]
+
+    # chunk 类型中文标签
+    _CHUNK_TYPE_CN = {
+        "cover": "封面", "preface": "前言/引言", "scope": "范围",
+        "references": "规范性引用文件", "term": "术语定义", "clause": "正文条款",
+        "table": "表格", "figure": "图示/公式", "appendix": "附录",
+    }
+
+    references = []
+    for chunk in expanded_results:
+        doc = services.document_service.get_document_by_id(db, chunk.document_id)
+
+        if chunk.id in direct_ids:
+            source_label = "直接命中"
+            score = direct_scores.get(chunk.id, 0.0)
+            match_type = direct_match_types.get(chunk.id, "linked")
+            priority = 0 if match_type in ("keyword", "hybrid") else 1
+        else:
+            # 判断是父级还是子级
+            is_parent = False
+            is_child = False
+            for item in results:
+                if item["chunk"].parent_chunk_id == chunk.id:
+                    is_parent = True
+                if chunk.parent_chunk_id and chunk.parent_chunk_id == item["chunk"].id:
+                    is_child = True
+
+            if is_parent:
+                source_label = "关联上下文-父级"
+                priority = 2
+            elif is_child:
+                source_label = "关联上下文-子级"
+                priority = 3
+            else:
+                source_label = "关联上下文"
+                priority = 2
+            score = 0.0
+            match_type = "linked"
+
+        # 获取内容：去掉内置前缀避免重复
+        raw_content = chunk.content or ""
+        clean_content = services.document_service._strip_chunk_prefix(raw_content)
+        # 表格类截断到 800 字，其余 1000 字封顶
+        if chunk.chunk_type == "table" and len(clean_content) > 800:
+            clean_content = clean_content[:800] + "\n[...表格过长，已截断...]"
+        elif len(clean_content) > 1000:
+            clean_content = clean_content[:1000] + "\n[...内容过长，已截断...]"
+
+        references.append({
+            "document_id": chunk.document_id,
+            "filename": doc.filename if doc else None,
+            "chunk_index": chunk.chunk_index,
+            "chunk_type": chunk.chunk_type,
+            "chunk_type_cn": _CHUNK_TYPE_CN.get(chunk.chunk_type, chunk.chunk_type or "未知"),
+            "section_path": chunk.section_path,
+            "page_number": chunk.page_number,
+            "score": score,
+            "content": clean_content,
+            "content_length": len(raw_content),
+            "match_type": match_type,
+            "source_label": source_label,
+            "priority": priority,
+        })
+
+    # 按优先级排序：直接关键词 > 直接语义 > 关联父级 > 关联子级
+    references.sort(key=lambda r: (r["priority"], -r["score"]))
+
+    if len(references) == 0:
+        return {
+            "question": request.question,
+            "answer": "没有找到相关参考资料，暂时无法回答。请确认：1) 已上传标准文件 2) 已为该文件生成切片。",
+            "references": [],
+            "auto_matched_document": {
+                "document_id": auto_matched_doc.id,
+                "filename": auto_matched_doc.filename,
+            } if auto_matched_doc else None,
+            "auto_match_fallback": auto_match_fallback,
+            "prompt_preview": None,
+        }
+
+    # ── 结构化 Context ──
+    context_parts = []
+    for index, ref in enumerate(references):
+        ctx = "【资料 {} — {}】".format(index + 1, ref["source_label"])
+        if ref["match_type"] != "linked":
+            ctx += "（{}匹配 | 相关度 {:.2f}）".format(ref["match_type"], ref["score"])
+        ctx += "\n"
+        ctx += "  类型：{}".format(ref["chunk_type_cn"])
+        if ref["chunk_type"]:
+            ctx += "（{}）".format(ref["chunk_type"])
+        ctx += "\n"
+        if ref["section_path"]:
+            ctx += "  章节路径：{}\n".format(ref["section_path"])
+        if ref["page_number"]:
+            ctx += "  页码：第 {} 页\n".format(ref["page_number"])
+        ctx += "  ---\n"
+        ctx += "  {}".format(ref["content"])
+        context_parts.append(ctx)
+
+    context_text = "\n\n".join(context_parts)
+
+    # ── 意图提示 ──
+    intent_hint = ""
+    if question_intent == "scope":
+        intent_hint = "【提示：用户意图是问适用范围/适用对象，优先参考类型为 范围（scope） 的资料】\n"
+    elif question_intent == "definition":
+        intent_hint = "【提示：用户意图是问定义/术语含义，优先参考类型为 术语定义（term） 的资料】\n"
+    elif question_intent == "requirement":
+        intent_hint = "【提示：用户意图是问具体要求/指标/参数，优先参考类型为 正文条款（clause）、表格（table） 的资料】\n"
+    elif question_intent == "references":
+        intent_hint = "【提示：用户意图是问引用了哪些标准/规范性引用文件，优先参考类型为 规范性引用文件（references） 的资料，逐条列出所有引用的标准编号和名称】\n"
+    elif question_intent == "clause_number":
+        intent_hint = "【提示：用户指定了具体条款编号，请优先定位到对应章节路径的正文条款（clause），逐字引用原文内容】\n"
+
+    # ── Prompt (增强版: 强制条款引用 + 原文摘录 + 实例化) ──
+    prompt = (
+        "你是一个专业的企业标准文档问答助手。请严格根据【参考资料】回答用户问题。\n"
+        "如果参考资料中没有答案，请明确回答：资料中未找到相关答案。\n"
+        "不要编造资料中没有的信息。\n\n"
+        "【资料格式说明】\n"
+        "- 类型：告知该资料在文档中的角色（封面/前言/范围/引用文件/术语定义/正文条款/表格/图示/附录）\n"
+        "- 章节路径：用 \">\" 分隔的条款层级路径，用于精确引用条款编号\n"
+        "- 页码：原始文档的物理页码\n"
+        "- \"直接命中\" = 与问题直接匹配（优先作为答案核心）；\"关联上下文-父级\" = 联动提供的上级条款\n"
+        "- \"关联上下文-子级\" = 联动提供的下级条款（补充细节）\n\n"
+        "【回答要求——必须严格遵守】\n"
+        "1. 每个结论必须明确引用章节路径中的条款编号（如\"根据 6.1.1 条款\"），不要只写切片序号\n"
+        "2. 关键条款必须摘录原文关键句，用「」括起来展示给用户，如：原文规定「喷淋头间距不应大于3.6m」\n"
+        "3. 涉及数值/参数/条件/指标时，必须逐一列出具体数值，禁止笼统概括为\"应符合相关要求\"\n"
+        "4. 对于抽象规定，给出一个具体的应用场景举例帮助用户理解\n"
+        "5. 直接命中的资料优先采用作为答案核心，关联上下文用于补充理解和确保完整性\n"
+        "6. 表格类资料需解读数据含义，不要仅复述表格原文\n"
+        "7. 如果某条款有例外条件或适用限制，务必一并说明\n"
+        "8. 回答要分层次：先一句话概括结论 → 再逐条展开细节（用 ①②③ 编号）\n"
+        "9. 如果参考资料不足，明确说\"当前资料中未找到相关答案\"\n"
+        "10. 如果问的是引用文件，必须逐条列出所有被引用的标准编号和标准名称，不能遗漏\n\n"
+        "【示例——你应该这样回答】\n"
+        "用户问：消防喷淋安装间距要求是什么？\n"
+        "✅ 正确的回答格式：\n"
+        "根据当前标准第 6.1.1 条（喷淋头布置间距），原文规定「标准覆盖面积喷头的布置间距不应小于1.8m，且不应大于3.6m」。\n"
+        "同时第 6.1.2 条补充了例外情况：\n"
+        "① 当安装高度超过8m时，间距上限调整为3.0m\n"
+        "② 在有障碍物遮挡的区域，间距应适当减小\n"
+        "③ 具体场景举例：在净高10m的仓库中，喷淋间距不得超过3.0m，建议采用2.8-3.0m的间距布置\n\n"
+        "{intent_hint}"
+        "用户问题：\n{question}\n\n"
+        "参考资料：\n{context_text}"
+    ).format(intent_hint=intent_hint, question=request.question, context_text=context_text)
+
+    answer = services.llm_service.generate_answer(prompt)
+
+    # ── 生成追问建议（基于回答内容推断）──
+    follow_up_questions = _generate_follow_ups(request.question, question_intent, references)
+
+    # ── 相关标准推荐（如有指定文档）──
+    recommendations = None
+    if request.document_id:
+        recommendations = services.document_service.recommend_related_standards(
+            db, request.document_id, request.question
+        )
+
+    return {
+        "question": request.question,
+        "question_intent": question_intent,
+        "search_mode": "hybrid",
+        "search_terms": search_terms,
+        "answer": answer,
+        "references": [{
+            "document_id": r["document_id"],
+            "filename": r["filename"],
+            "chunk_index": r["chunk_index"],
+            "chunk_type": r["chunk_type"],
+            "chunk_type_cn": r["chunk_type_cn"],
+            "section_path": r["section_path"],
+            "page_number": r["page_number"],
+            "score": r["score"],
+            "content_preview": r["content"][:300],
+            "content_length": r["content_length"],
+            "match_type": r["match_type"],
+            "source_label": r["source_label"],
+        } for r in references],
+        "follow_up_questions": follow_up_questions,
+        "recommendations": recommendations,
+        "auto_matched_document": {
+            "document_id": auto_matched_doc.id,
+            "filename": auto_matched_doc.filename,
+        } if auto_matched_doc else None,
+        "auto_match_fallback": auto_match_fallback,
+        "prompt_preview": None,
+    }
+
+
+@router.post("/ask/stream")
+async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
+    """
+    SSE 流式问答接口。
+    先推送检索元信息（references + recommendations），再逐 token 推送 LLM 生成内容。
+    """
+    # ── 0. 自动文档匹配 ──
+    effective_doc_id = request.document_id
+    auto_matched_doc = None
+    if effective_doc_id is None:
+        effective_doc_id = services.document_service._match_question_to_documents(db, request.question)
+        if effective_doc_id is not None:
+            auto_matched_doc = services.document_service.get_document_by_id(db, effective_doc_id)
+
+    # ── 1. 检索阶段（同步，和 /ask 逻辑一致）──
+    results = services.document_service.hybrid_search_chunks(
+        db, request.question, request.limit, document_id=effective_doc_id
+    )
+
+    # 自动匹配回退：如果限定文档无结果，回退到全库搜索
+    auto_match_fallback = False
+    if len(results) == 0 and effective_doc_id is not None and request.document_id is None:
+        auto_match_fallback = True
+        effective_doc_id = None  # 回退：取消文档限定
+        # 注意：保留 auto_matched_doc 以告知前端曾经匹配了哪个文档
+        results = services.document_service.hybrid_search_chunks(
+            db, request.question, request.limit, document_id=None
+        )
+
+    search_terms = services.document_service.extract_search_terms(request.question)
+    question_intent = services.document_service.infer_question_intent(request.question)
+    expanded_results = services.document_service.expand_search_results(db, results, depth=1)
+
+    # 收集直接命中信息
+    direct_ids = set()
+    direct_scores = {}
+    direct_match_types = {}
+    for item in results:
+        cid = item["chunk"].id
+        direct_ids.add(cid)
+        direct_scores[cid] = item["score"]
+        direct_match_types[cid] = item["match_type"]
+
+    _CHUNK_TYPE_CN = {
+        "cover": "封面", "preface": "前言/引言", "scope": "范围",
+        "references": "规范性引用文件", "term": "术语定义", "clause": "正文条款",
+        "table": "表格", "figure": "图示/公式", "appendix": "附录",
+    }
+
+    # 组装 references
+    references = []
+    for chunk in expanded_results:
+        doc = services.document_service.get_document_by_id(db, chunk.document_id)
+        if chunk.id in direct_ids:
+            source_label = "直接命中"
+            score = direct_scores.get(chunk.id, 0.0)
+            match_type = direct_match_types.get(chunk.id, "linked")
+            priority = 0 if match_type in ("keyword", "hybrid") else 1
+        else:
+            is_parent = False
+            is_child = False
+            for item in results:
+                if item["chunk"].parent_chunk_id == chunk.id:
+                    is_parent = True
+                if chunk.parent_chunk_id and chunk.parent_chunk_id == item["chunk"].id:
+                    is_child = True
+            if is_parent:
+                source_label = "关联上下文-父级"
+                priority = 2
+            elif is_child:
+                source_label = "关联上下文-子级"
+                priority = 3
+            else:
+                source_label = "关联上下文"
+                priority = 2
+            score = 0.0
+            match_type = "linked"
+
+        raw_content = chunk.content or ""
+        clean_content = services.document_service._strip_chunk_prefix(raw_content)
+        if chunk.chunk_type == "table" and len(clean_content) > 800:
+            clean_content = clean_content[:800] + "\n[...表格过长，已截断...]"
+        elif len(clean_content) > 1000:
+            clean_content = clean_content[:1000] + "\n[...内容过长，已截断...]"
+
+        references.append({
+            "document_id": chunk.document_id,
+            "filename": doc.filename if doc else None,
+            "chunk_index": chunk.chunk_index,
+            "chunk_type": chunk.chunk_type,
+            "chunk_type_cn": _CHUNK_TYPE_CN.get(chunk.chunk_type, chunk.chunk_type or "未知"),
+            "section_path": chunk.section_path,
+            "page_number": chunk.page_number,
+            "score": score,
+            "content": clean_content,
+            "content_length": len(raw_content),
+            "match_type": match_type,
+            "source_label": source_label,
+            "priority": priority,
+        })
+
+    references.sort(key=lambda r: (r["priority"], -r["score"]))
+
+    if len(references) == 0:
+        # 无资料时也走流式返回，包含自动匹配信息
+        async def empty_stream():
+            yield "data: {}\n\n".format(json.dumps({
+                "type": "meta",
+                "references": [],
+                "recommendations": None,
+                "follow_up_questions": [],
+                "auto_matched_document": {
+                    "document_id": auto_matched_doc.id,
+                    "filename": auto_matched_doc.filename,
+                } if auto_matched_doc else None,
+                "auto_match_fallback": auto_match_fallback,
+            }, ensure_ascii=False))
+            yield "data: {}\n\n".format(json.dumps({
+                "type": "answer",
+                "content": "没有找到相关参考资料，暂时无法回答。请确认：1) 已上传标准文件 2) 已为该文件生成切片。",
+            }, ensure_ascii=False))
+            yield "data: {}\n\n".format(json.dumps({"type": "done"}))
+
+        return StreamingResponse(empty_stream(), media_type="text/event-stream")
+
+    # ── 2. 构建 context 和 prompt ──
+    context_parts = []
+    for index, ref in enumerate(references):
+        ctx = "【资料 {} — {}】".format(index + 1, ref["source_label"])
+        if ref["match_type"] != "linked":
+            ctx += "（{}匹配 | 相关度 {:.2f}）".format(ref["match_type"], ref["score"])
+        ctx += "\n"
+        ctx += "  类型：{}".format(ref["chunk_type_cn"])
+        if ref["chunk_type"]:
+            ctx += "（{}）".format(ref["chunk_type"])
+        ctx += "\n"
+        if ref["section_path"]:
+            ctx += "  章节路径：{}\n".format(ref["section_path"])
+        if ref["page_number"]:
+            ctx += "  页码：第 {} 页\n".format(ref["page_number"])
+        ctx += "  ---\n"
+        ctx += "  {}".format(ref["content"])
+        context_parts.append(ctx)
+
+    context_text = "\n\n".join(context_parts)
+
+    intent_hint = ""
+    if question_intent == "scope":
+        intent_hint = "【提示：用户意图是问适用范围/适用对象，优先参考类型为 范围（scope） 的资料】\n"
+    elif question_intent == "definition":
+        intent_hint = "【提示：用户意图是问定义/术语含义，优先参考类型为 术语定义（term） 的资料】\n"
+    elif question_intent == "requirement":
+        intent_hint = "【提示：用户意图是问具体要求/指标/参数，优先参考类型为 正文条款（clause）、表格（table） 的资料】\n"
+    elif question_intent == "references":
+        intent_hint = "【提示：用户意图是问引用了哪些标准/规范性引用文件，优先参考类型为 规范性引用文件（references） 的资料，逐条列出所有引用的标准编号和名称】\n"
+    elif question_intent == "clause_number":
+        intent_hint = "【提示：用户指定了具体条款编号，请优先定位到对应章节路径的正文条款（clause），逐字引用原文内容】\n"
+
+    prompt = (
+        "你是一个专业的企业标准文档问答助手。请严格根据【参考资料】回答用户问题。\n"
+        "如果参考资料中没有答案，请明确回答：资料中未找到相关答案。\n"
+        "不要编造资料中没有的信息。\n\n"
+        "【资料格式说明】\n"
+        "- 类型：告知该资料在文档中的角色（封面/前言/范围/引用文件/术语定义/正文条款/表格/图示/附录）\n"
+        "- 章节路径：用 \">\" 分隔的条款层级路径，用于精确引用条款编号\n"
+        "- 页码：原始文档的物理页码\n"
+        "- \"直接命中\" = 与问题直接匹配（优先作为答案核心）；\"关联上下文-父级\" = 联动提供的上级条款\n"
+        "- \"关联上下文-子级\" = 联动提供的下级条款（补充细节）\n\n"
+        "【回答要求——必须严格遵守】\n"
+        "1. 每个结论必须明确引用章节路径中的条款编号（如\"根据 6.1.1 条款\"），不要只写切片序号\n"
+        "2. 关键条款必须摘录原文关键句，用「」括起来展示给用户\n"
+        "3. 涉及数值/参数/条件/指标时，必须逐一列出具体数值，禁止笼统概括\n"
+        "4. 对于抽象规定，给出一个具体的应用场景举例帮助用户理解\n"
+        "5. 直接命中的资料优先采用作为答案核心，关联上下文用于补充理解和确保完整性\n"
+        "6. 表格类资料需解读数据含义，不要仅复述表格原文\n"
+        "7. 如果某条款有例外条件或适用限制，务必一并说明\n"
+        "8. 回答要分层次：先一句话概括结论 → 再逐条展开细节（用 ①②③ 编号）\n"
+        "9. 如果参考资料不足，明确说\"当前资料中未找到相关答案\"\n\n"
+        "{intent_hint}"
+        "用户问题：\n{question}\n\n"
+        "参考资料：\n{context_text}"
+    ).format(intent_hint=intent_hint, question=request.question, context_text=context_text)
+
+    # ── 3. 推荐 ──
+    recommendations = None
+    if request.document_id:
+        recommendations = services.document_service.recommend_related_standards(
+            db, request.document_id, request.question
+        )
+
+    # ── 4. 追问建议 ──
+    follow_up_questions = _generate_follow_ups(request.question, question_intent, references)
+
+    # ── 5. SSE 流式响应 ──
+    async def event_stream():
+        # 先推送元信息
+        meta = {
+            "type": "meta",
+            "question_intent": question_intent,
+            "search_terms": search_terms,
+            "references": [{
+                "document_id": r["document_id"],
+                "filename": r["filename"],
+                "chunk_index": r["chunk_index"],
+                "chunk_type": r["chunk_type"],
+                "chunk_type_cn": r["chunk_type_cn"],
+                "section_path": r["section_path"],
+                "page_number": r["page_number"],
+                "score": r["score"],
+                "content_preview": r["content"][:300],
+                "content_length": r["content_length"],
+                "match_type": r["match_type"],
+                "source_label": r["source_label"],
+            } for r in references],
+            "recommendations": recommendations,
+            "follow_up_questions": follow_up_questions,
+            "auto_matched_document": {
+                "document_id": auto_matched_doc.id,
+                "filename": auto_matched_doc.filename,
+            } if auto_matched_doc else None,
+            "auto_match_fallback": auto_match_fallback,
+        }
+        yield "data: {}\n\n".format(json.dumps(meta, ensure_ascii=False))
+
+        # 流式推送 LLM token
+        full_answer = ""
+        try:
+            stream = services.llm_service.generate_answer_stream(prompt)
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    token = chunk.choices[0].delta.content
+                    full_answer += token
+                    yield "data: {}\n\n".format(json.dumps({
+                        "type": "token",
+                        "content": token,
+                    }, ensure_ascii=False))
+        except Exception as e:
+            yield "data: {}\n\n".format(json.dumps({
+                "type": "error",
+                "message": "LLM 生成失败: {}".format(str(e)),
+            }, ensure_ascii=False))
+
+        # 完成信号
+        yield "data: {}\n\n".format(json.dumps({
+            "type": "done",
+            "full_answer_length": len(full_answer),
+        }))
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/documents", response_model=DocumentListResponse)  # 查询标准文件接口
+async def get_documents(filename: str | None = Query(None),standard_type: str | None = Query(None),
+                        industry: str | None = Query(None),tag: str | None = Query(None),page: int = Query(1, ge=1),
+                        page_size: int = Query(5, le=100),db: Session = Depends(get_db)):
+    total_count,page_documents =  (services.document_service.get_documents(db,
+                                                                           filename,
+                                                                           standard_type,
+                                                                           industry,tag,page,page_size)
+                                   )
+    result = {"message": "查询标准文件成功",
+              "documents": page_documents,
+              "page": page,
+              "page_size": page_size,
+              "total_count": total_count,
+              }
+    return result
+
+
+@router.get("/documents/stats", response_model=DocumentStatsResponse)  # 标准文件统计接口
+async def get_document_stats(db: Session = Depends(get_db)):
+    total,standard_types,industries,tag_stats = services.document_service.get_document_stats(db)
+    return {"total": total,
+            "standard_types": standard_types,
+            "industries": industries,
+            "tags": tag_stats,
+            }
+
+
+@router.get("/documents/search", response_model=DocumentSearchResponse)  # 标准化关键词搜索接口哦
+async def search_documents(keyword: str = Query(..., min_length=1, max_length=20),
+                           page: int = Query(1, ge=1),page_size: int = Query(5, le=100),
+                           db: Session = Depends(get_db)):
+    keyword, total_count, has_more, page_documents = services.document_service.search_documents(
+        db,keyword, page, page_size
+    )
+    return {"message": "搜索标准文件成功",
+            "keyword": keyword,
+            "total_count": total_count,
+            "page": page,
+            "page_size": page_size,
+            "has_more": has_more,
+            "documents": page_documents,
+            }
+
+@router.get("/documents/{document_id}", response_model=DocumentOut)  # 根据标准文件的id去查询相对应的标准文件
+async def get_document_by_id(document_id: int,db: Session = Depends(get_db)):
+    document = services.document_service.get_document_by_id(db,document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return document
+
+
+@router.patch("/documents/{document_id}", response_model=DocumentMessageOut)  # 根据标准文件的id去修改相对应的标准文件信息
+async def update_document_by_id(document_id: int, patch_document: DocumentUpdate,
+                                db: Session = Depends(get_db)):
+    document = services.document_service.get_document_by_id(db,document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="您要修改的标准文件不存在")
+    existing_document = services.document_service.patch_document_filename(db,patch_document.filename)
+    if existing_document is not None and existing_document.id != document_id:
+        raise HTTPException(status_code=409, detail="标准文件已存在")
+    document = services.document_service.patch_document(
+        db,patch_document.filename,patch_document.standard_type,patch_document.industry,patch_document.tags,document)
+    if document is None:
+        raise HTTPException(status_code=500, detail="修改标准文件失败")
+    return {"message": "修改标准文件信息成功",
+            "document": document, }
+
+
+@router.delete("/documents/{document_id}", response_model=MessageOut)  # 根据标准文件的id去删除相对应的文件
+async def delete_document_by_id(document_id: int,
+                                db: Session = Depends(get_db)):
+    document = services.document_service.get_document_by_id(db,document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="您要删除的标准文件不存在")
+    # 先删磁盘文件
+    file_path = Path(document.filepath) if document.filepath else None
+    delete_success = services.document_service.delete_document(db, document)
+    if delete_success is False:
+        raise HTTPException(status_code=500, detail="删除标准文件失败")
+    # 再清理磁盘上的文件
+    if file_path and file_path.exists():
+        file_path.unlink()
+    return {"message": "删除指定标准文件成功"}
+
+
+@router.get("/documents/{document_id}/download")
+async def download_document(document_id: int,db: Session = Depends(get_db)):
+    document = services.document_service.download_document(db,document_id)
+    if document is None:
+        raise HTTPException(status_code=404,detail="您要的标准文件不存在")
+    path = document.filepath
+    file_path = Path(path)
+    if document.filename is None:
+        raise HTTPException(status_code=404, detail="您要的标准文件不存在")
+    if not file_path.exists():
+        raise HTTPException(status_code=404,detail="该文件资源已被删除")
+    return FileResponse(path=file_path,filename=document.filename,media_type='application/octet-stream',)
+
+@router.post("/documents/{document_id}/chunks")
+async def chunk_documents(document_id: int,db: Session = Depends(get_db)):
+    document = services.document_service.get_document_by_id(db, document_id)
+    if document is None:  # 判断这个文件id在不在数据库
+        raise HTTPException(status_code=404, detail="您要的标准文件不存在")
+    filepath = document.filepath
+
+    if filepath is None: #判断有没有这个文件资源，可能有id但是被删除了，没有文件
+        raise HTTPException(status_code=400, detail="该文件没有上传资源")
+
+    try:
+        text = services.document_service.parse_document(filepath)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if text is None or text.strip() == "":
+        raise HTTPException(status_code=400, detail="文档解析结果为空，无法生成切片")
+    # v2 结构感知切片：返回 list[dict]，每个 dict 含 content + 元信息
+    chunks_v2 = services.document_service.smart_split_v2(text, filename=document.filename or "")
+    delete_success = services.document_service.delete_chunks_by_id(db, document_id)  # 删旧 chunks
+
+    if delete_success is False:
+        raise HTTPException(status_code=404, detail="文件切片删除失败")
+    save_chunk = services.document_service.save_document_chunk(db, chunks_v2, document_id)  # 存新 chunks
+
+    if save_chunk is None:
+        raise HTTPException(status_code=500, detail="文档切片保存失败")
+
+    # 统计各类型数量
+    type_counts = {}
+    for c in chunks_v2:
+        ct = c.get("chunk_type", "unknown") if isinstance(c, dict) else "unknown"
+        type_counts[ct] = type_counts.get(ct, 0) + 1
+
+    return {
+        "message": "文档切片预览成功（v2 结构感知切片）",
+        "document_id": document.id,
+        "filename": document.filename,
+        "total_chunks": len(chunks_v2),
+        "chunk_types": type_counts,
+    }
+
+
+@router.post("/documents/{document_id}/analyze")
+def analyze_document(
+        document_id: int,
+        db: Session = Depends(get_db)
+):
+    document = services.document_service.get_document_by_id(db, document_id)
+
+    if document is None:
+        raise HTTPException(status_code=404, detail="标准文件不存在")
+
+    analysis = services.anaylysis_service.generate_document_analysis(db,document)
+    if analysis is None:
+        raise HTTPException(
+            status_code=400,
+            detail="该文档暂无可分析内容，请先生成 chunks 或检查文档解析结果"
+        )
+
+    return {
+        "message": "文档分析成功",
+        "document_id": document.id,
+        "filename": document.filename,
+        "analysis": {
+            "id": analysis.id,
+            "standard_type_guess": analysis.standard_type_guess,
+            "industry_guess": analysis.industry_guess,
+            "summary": analysis.summary,
+            "keywords": analysis.keywords,
+            "scope": analysis.scope,
+            "created_at": analysis.created_at,
+        }
+    }

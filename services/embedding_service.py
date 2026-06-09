@@ -1,0 +1,74 @@
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+import json
+import sys
+from sentence_transformers import SentenceTransformer
+
+_model = None
+_model_load_error = None
+
+
+def get_model():
+    """获取 embedding 模型实例，带异常处理和友好提示"""
+    global _model, _model_load_error
+
+    if _model is not None:
+        return _model
+
+    if _model_load_error is not None:
+        raise _model_load_error
+
+    model_name = "paraphrase-multilingual-MiniLM-L12-v2"
+    try:
+        print(f"[Embedding] 正在加载模型 {model_name}，首次加载可能需要下载...")
+        print("[Embedding] 下载源: https://hf-mirror.com")
+        _model = SentenceTransformer(model_name)
+        print("[Embedding] 模型加载完成！")
+    except Exception as e:
+        _model_load_error = RuntimeError(
+            f"Embedding 模型加载失败: {e}\n"
+            "请检查网络连接，或尝试手动下载模型放置到本地。"
+        )
+        raise _model_load_error
+
+    return _model
+
+
+def generate_embedding(text: str) -> list[float]:
+    """生成文本的向量嵌入"""
+    try:
+        model = get_model()
+        embedding = model.encode(text)
+        return embedding.tolist()
+    except Exception as e:
+        print(f"[Embedding] 生成 embedding 失败: {e}", file=sys.stderr)
+        raise
+
+
+def embedding_to_json(embedding: list[float]) -> str:
+    return json.dumps(embedding)
+
+
+def json_to_embedding(embedding_json: str) -> list[float]:
+    return json.loads(embedding_json)
+
+import math
+def cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
+    """
+    计算两个向量的余弦相似度
+    返回值越接近 1，说明越相似
+    """
+    dot_product = 0
+    norm_vec1 = 0
+    norm_vec2 = 0
+
+    for a, b in zip(vec1, vec2):
+        dot_product += a * b
+        norm_vec1 += a * a
+        norm_vec2 += b * b
+
+    if norm_vec1 == 0 or norm_vec2 == 0:
+        return 0.0
+
+    return dot_product / (math.sqrt(norm_vec1) * math.sqrt(norm_vec2))

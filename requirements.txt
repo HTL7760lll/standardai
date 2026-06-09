@@ -1,0 +1,30 @@
+# Web Framework
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
+
+# Database
+sqlalchemy>=2.0.0
+pymysql>=1.1.0
+
+# Document Parsing
+pypdf>=3.0.0
+python-docx>=0.8.11
+
+# AI / Embedding
+sentence-transformers>=2.2.0
+openai>=1.0.0
+
+# OCR (scanned PDF support)
+paddlepaddle>=2.5.0
+paddleocr>=2.7.0
+PyMuPDF>=1.23.0
+
+# Chinese Word Segmentation
+jieba>=0.42.1
+
+# Config
+python-dotenv>=1.0.0
+
+# Pydantic (pinned by FastAPI)
+pydantic>=2.0.0
