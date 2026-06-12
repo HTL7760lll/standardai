@@ -11,6 +11,9 @@ from pathlib import Path
 import uuid
 import re
 import tempfile
+from logging_config import get_logger
+
+logger = get_logger(__name__)
 
 # PDF 解析
 from pypdf import PdfReader
@@ -53,9 +56,9 @@ def _get_paddleocr():
                 try:
                     from paddleocr import PaddleOCR
                     _paddleocr_engine = PaddleOCR(lang='ch', use_angle_cls=True)
-                    print("[OCR] PaddleOCR 引擎初始化完成")
+                    logger.info("PaddleOCR 引擎初始化完成")
                 except Exception as e:
-                    print(f"[OCR] PaddleOCR 初始化失败: {e}，将禁用 OCR 功能")
+                    logger.error(f"PaddleOCR 初始化失败: {e}，将禁用 OCR 功能")
                     _ocr_degraded = True
                     _paddleocr_engine = None
     return _paddleocr_engine
@@ -353,7 +356,7 @@ def _ocr_single_image(image_path: str) -> str | None:
             parts = [line[1][0] for line in result[0]]
             return " ".join(parts).strip()
     except Exception as e:
-        print(f"[OCR] 单图 OCR 失败: {e}")
+        logger.warning(f"单图 OCR 失败: {e}")
         _ocr_degraded = True
     return None
 
@@ -396,7 +399,7 @@ def _extract_docx_images(doc) -> list[str]:
                 finally:
                     Path(tmp_path).unlink(missing_ok=True)
     except Exception as e:
-        print(f"[DOCX] 提取嵌入图片失败: {e}")
+        logger.warning(f"提取嵌入图片失败: {e}")
 
     return image_texts
 
@@ -440,7 +443,7 @@ async def get_file(file):
     if suffix not in allowed_extensions:
         return None
     file_bytes = await file.read()
-    print("上传文件读取字节数：", len(file_bytes))
+    logger.info(f"上传文件读取字节数：{len(file_bytes)}")
     saved_name = uuid.uuid4().hex + suffix
     filepath = UPLOAD_DIR / saved_name
     filepath.write_bytes(file_bytes)
@@ -627,7 +630,7 @@ def parse_document(filepath):
     # ── TXT ───────────────────────────────────────────────
     if suffix == ".txt":
         text = file_path.read_text(encoding="utf-8")
-        print("解析文本长度：", len(text))
+        logger.info(f"解析文本长度：{len(text)}")
         return text
 
     # ── PDF ───────────────────────────────────────────────
@@ -643,11 +646,11 @@ def parse_document(filepath):
 
         # 检测是否乱码或空文本
         if _is_text_garbled(text):
-            print(f"[OCR] PDF 文本层乱码/为空（可读率低），降级到 PaddleOCR: {file_path}")
+            logger.warning(f"PDF 文本层乱码/为空，降级到 PaddleOCR: {file_path}")
 
             # 检查 OCR 引擎是否可用
             if _ocr_degraded:
-                print("[OCR] OCR 引擎已降级，返回原始文本（可能含乱码），请手动检查")
+                logger.warning("OCR 引擎已降级，返回原始文本（可能含乱码），请手动检查")
                 # 返回原始文本但带上警告标记
                 warning = (
                     "【警告】该 PDF 文本层可能包含乱码，且 OCR 引擎不可用。"
@@ -658,12 +661,12 @@ def parse_document(filepath):
             try:
                 ocr_text = _ocr_pdf_with_paddle(str(file_path))
                 if ocr_text.strip():
-                    print(f"[OCR] OCR 成功，识别文本长度: {len(ocr_text)}")
+                    logger.info(f"OCR 成功，识别文本长度: {len(ocr_text)}")
                     return ocr_text
                 else:
-                    print("[OCR] OCR 识别结果也为空")
+                    logger.warning("OCR 识别结果也为空")
             except Exception as e:
-                print(f"[OCR] PaddleOCR 识别失败: {e}")
+                logger.error(f"PaddleOCR 识别失败: {e}")
                 traceback.print_exc()
                 # 标记 OCR 降级
                 _ocr_degraded = True
@@ -708,9 +711,9 @@ def parse_document(filepath):
             if docx_image_texts:
                 for idx, img_text in enumerate(docx_image_texts, start=1):
                     text_parts.append(f"\n\n===== [文档图片 {idx} OCR] =====\n{img_text}")
-                print(f"[DOCX] 从 {len(docx_image_texts)} 张嵌入图片中 OCR 提取了文本")
+                logger.info(f"从 {len(docx_image_texts)} 张嵌入图片中 OCR 提取了文本")
         except Exception as e:
-            print(f"[DOCX] 嵌入图片 OCR 失败（非致命）: {e}")
+            logger.warning(f"嵌入图片 OCR 失败（非致命）: {e}")
 
         text = "\n".join(text_parts)
 
@@ -965,17 +968,26 @@ def _detect_major_sections(text: str) -> list[dict]:
                 "content": cover_text,
             })
         elif cover_text and len(cover_text) > 3000:
-            # 封面内容太长 → 说明检测不全，退化为 clauses
-            # 清空已有的，把整篇作为正文
-            sections.clear()
-            sections.append({
-                "type": "clauses",
-                "title": "正文",
-                "start_line": 0,
-                "end_line": len(lines),
-                "content": text,
-            })
-            return sections
+            # 封面内容超长 → 截断封面，保留后续检测到的章节结构
+            logger.warning(f"封面内容 {len(cover_text)} 字，超过 3000 字上限，截断处理")
+            truncated_lines = lines[:first_header_line]
+            # 取前 ~2000 字作为封面
+            truncated = ""
+            char_count = 0
+            for line in truncated_lines:
+                if char_count > 2000:
+                    break
+                truncated += line + "\n"
+                char_count += len(line) + 1
+            cover_text = truncated.strip()
+            if cover_text and len(cover_text) > 20:
+                sections.append({
+                    "type": "cover",
+                    "title": "封面(截断)",
+                    "start_line": 0,
+                    "end_line": first_header_line,
+                    "content": cover_text,
+                })
 
     # 按标题切分区域
     for idx, (line_idx, stype, title) in enumerate(header_positions):
@@ -1317,7 +1329,7 @@ def _chunk_cover(sec: dict, std_info: dict, char_to_page: dict) -> list[dict]:
 
     # 内容量守卫：封面不应超过 2000 字
     if len(content) > 2000:
-        print(f"[切片] 封面内容过长 ({len(content)} 字)，回退到段落切片")
+        logger.warning(f"封面内容过长 ({len(content)} 字)，回退到段落切片")
         return _chunk_fallback_paragraphs(content, std_info, char_to_page, "cover")
 
     # 控制在 500 字以内
@@ -1741,7 +1753,6 @@ def _classify_document_type(text: str, filename: str = "") -> str:
       national_standard  — GB, GB/T, GBZ, GJB
       industry_standard  — NY/T, HJ/T, SN/T, YY/T, DBxx/T 等行业标准
       enterprise_standard — Q/ 企业标准
-      thesis             — 论文（摘要+Abstract+章节+参考文献特征）
       generic            — 通用文档
     """
     head = text[:3000] if len(text) > 3000 else text
@@ -1770,122 +1781,11 @@ def _classify_document_type(text: str, filename: str = "") -> str:
     if re.search(r'\bQ/\s*\w', head):
         return "enterprise_standard"
 
-    # ── 论文检测 ──
-    thesis_signals = 0
-    if re.search(r'摘\s*要|内容提要', head):
-        thesis_signals += 1
-    if re.search(r'\bAbstract\b', head):
-        thesis_signals += 1
-    if re.search(r'第[一二三四五六七八九十\d]+章', head):
-        thesis_signals += 1
-    if re.search(r'参考文献|参考书目', head):
-        thesis_signals += 1
-    if re.search(r'致\s*谢|鸣\s*谢', head):
-        thesis_signals += 1
-    if re.search(r'结\s*论|总\s*结|结束语', head):
-        thesis_signals += 1
-    if re.search(r'毕业论文|学位论文|硕士论文|博士论文|毕业设计', head):
-        thesis_signals += 2
-    if re.search(r'学\s*院[：:]\s*\S|专\s*业[：:]\s*\S|导\s*师[：:]\s*\S|学\s*号[：:]\s*\d', head):
-        thesis_signals += 1
-
-    if thesis_signals >= 3:
-        return "thesis"
-
     # ── 有编号结构但无标准编号 → 按行业标准处理 ──
     if re.search(r'\n\d+(?:\.\d+)*\s+\S', head):
         return "industry_standard"
 
     return "generic"
-
-
-def _detect_sections_thesis(text: str) -> list[dict]:
-    """
-    论文章节检测。
-    识别：摘要(中/英) → 目录 → 第X章 → 结论 → 参考文献 → 致谢 → 附录
-    """
-    lines = text.split('\n')
-    sections = []
-
-    thesis_patterns = [
-        (r'^摘\s*要\s*$|^内容提要\s*$', 'abstract'),
-        (r'^\s*Abstract\s*$', 'abstract_en'),
-        (r'^目\s*录\s*$|^目\s*次\s*$', 'toc'),
-        (r'^第[一二三四五六七八九十\d]+章', 'chapter'),
-        (r'^结\s*论\s*$|^总\s*结\s*$|^结束语\s*$', 'conclusion'),
-        (r'^参考文献\s*$|^参考书目\s*$', 'references'),
-        (r'^致\s*谢\s*$|^鸣\s*谢\s*$', 'acknowledgment'),
-        (r'^附录\s*[A-Za-z]', 'appendix'),
-    ]
-
-    header_positions = []
-    for i, line in enumerate(lines):
-        line_clean = line.strip()
-        if not line_clean or len(line_clean) > 80:
-            continue
-        # 跳过目录行
-        if re.search(r'\.{5,}', line_clean) or re.search(r'…{2,}', line_clean):
-            continue
-        for pat, stype in thesis_patterns:
-            if re.match(pat, line_clean):
-                header_positions.append((i, stype, line_clean))
-                break
-
-    if not header_positions:
-        sections.append({
-            "type": "clauses", "title": "正文",
-            "start_line": 0, "end_line": len(lines), "content": text,
-        })
-        return sections
-
-    # 封面
-    first_line = header_positions[0][0]
-    if first_line > 0:
-        cover_text = '\n'.join(lines[:first_line]).strip()
-        if 20 < len(cover_text) <= 3000:
-            sections.append({
-                "type": "cover", "title": "封面",
-                "start_line": 0, "end_line": first_line, "content": cover_text,
-            })
-
-    # 切分
-    for idx, (line_idx, stype, title) in enumerate(header_positions):
-        next_line = header_positions[idx + 1][0] if idx + 1 < len(header_positions) else len(lines)
-        sec_text = '\n'.join(lines[line_idx:next_line]).strip()
-        char_start = sum(len(lines[k]) + 1 for k in range(line_idx))
-        sections.append({
-            "type": stype, "title": title,
-            "start_line": line_idx, "end_line": next_line,
-            "start_char": char_start, "content": sec_text,
-        })
-
-    return sections
-
-
-def _build_structure_thesis(text: str, filename: str) -> dict:
-    """为论文构建解析结构，复用 parse_document_structure 的输出格式。"""
-    pages, char_to_page = _map_page_numbers(text)
-    std_info = _extract_standard_info(text, filename)
-    sections = _detect_sections_thesis(text)
-
-    # 对 chapter 类型解析条款树
-    for sec in sections:
-        if sec["type"] == "chapter":
-            sec["clauses"] = _parse_clause_tree(sec["content"])
-            sec["flat_clauses"] = _flatten_clauses(sec["clauses"])
-        elif sec["type"] == "appendix":
-            sec["clauses"] = _parse_clause_tree(sec["content"])
-            label = sec.get("title", "附录")
-            sec["flat_clauses"] = _flatten_clauses(sec["clauses"], label)
-
-    tables = _extract_tables_from_text(text)
-    figures = _extract_figures_from_text(text)
-
-    return {
-        "sections": sections, "standard_info": std_info,
-        "tables": tables, "figures": figures,
-        "pages": pages, "char_to_page": char_to_page,
-    }
 
 
 def smart_split_v2(text: str, filename: str = "") -> list[dict]:
@@ -1894,7 +1794,6 @@ def smart_split_v2(text: str, filename: str = "") -> list[dict]:
     - national_standard → GB/T 条款层级切片（严格）
     - industry_standard → 行业标准切片（灵活条款）
     - enterprise_standard → 企业标准切片（灵活编号）
-    - thesis → 论文章节切片
     - generic → 语义段落切片（兜底）
 
     语义保障：每个 chunk 以完整段落/条款为最小单位，绝不在句子中间截断。
@@ -1989,50 +1888,6 @@ def smart_split_v2(text: str, filename: str = "") -> list[dict]:
         _assign_parent_refs(all_chunks)
         return all_chunks
 
-    # ── thesis ──
-    if doc_type == "thesis":
-        struct = _build_structure_thesis(text, filename)
-        std_info = struct.get("standard_info", {})
-        char_to_page = struct.get("char_to_page", {})
-
-        all_chunks = []
-        # 论文各类型→chunk 映射
-        type_handlers = {
-            "cover": _chunk_cover,
-            "abstract": lambda s, i, c: _chunk_fallback_paragraphs(s.get("content", ""), i, c, "摘要", 400),
-            "abstract_en": lambda s, i, c: _chunk_fallback_paragraphs(s.get("content", ""), i, c, "Abstract", 400),
-            "chapter": lambda s, i, c: _chunk_clauses(
-                s.get("flat_clauses", []), i, c, s.get("start_char", 0)
-            ) if s.get("flat_clauses") else _chunk_fallback_paragraphs(
-                s.get("content", ""), i, c, s.get("title", "章节")
-            ),
-            "conclusion": lambda s, i, c: _chunk_fallback_paragraphs(s.get("content", ""), i, c, "结论", 500),
-            "references": lambda s, i, c: _chunk_fallback_paragraphs(s.get("content", ""), i, c, "参考文献", 600),
-            "acknowledgment": lambda s, i, c: _chunk_fallback_paragraphs(s.get("content", ""), i, c, "致谢", 400),
-            "appendix": _chunk_appendix,
-        }
-
-        for sec in struct.get("sections", []):
-            stype = sec.get("type", "")
-            handler = type_handlers.get(stype)
-            if handler:
-                all_chunks.extend(handler(sec, std_info, char_to_page))
-            else:
-                content = sec.get("content", "")
-                if content:
-                    all_chunks.extend(_chunk_fallback_paragraphs(content, std_info, char_to_page, sec.get("title", "章节")))
-
-        all_chunks.extend(_chunk_tables(struct.get("tables", []), std_info, char_to_page))
-        all_chunks.extend(_chunk_figures(struct.get("figures", []), std_info, char_to_page))
-
-        if not all_chunks:
-            all_chunks = _chunk_fallback_paragraphs(text, std_info, char_to_page, "全文")
-        if len(text.strip()) > 2000 and len(all_chunks) < 3:
-            all_chunks = _chunk_fallback_paragraphs(text, std_info, char_to_page, "全文")
-
-        _assign_parent_refs(all_chunks)
-        return all_chunks
-
     # ── generic ──
     pages, char_to_page = _map_page_numbers(text)
     std_info = _extract_standard_info(text, filename)
@@ -2100,12 +1955,7 @@ def save_document_chunk(db, chunks, document_id: int):
 
             embedding = services.embedding_service.generate_embedding(content)
             embedding_json = services.embedding_service.embedding_to_json(embedding)
-            print("当前 document_id:", document_id)
-            print("当前 chunk_index:", index)
-            print("chunk 长度:", len(content))
-            print("chunk_type:", chunk_type)
-            print("section_path:", section_path)
-            print("chunk 前100字符:", repr(content[:100]))
+            logger.debug(f"chunk #{index} doc={document_id} len={len(content)} type={chunk_type} path={section_path}")
             chunk_record = DocumentChunk(
                 document_id=document_id,
                 chunk_index=index,
@@ -2142,7 +1992,7 @@ def save_document_chunk(db, chunks, document_id: int):
 
         db.commit()
     except SQLAlchemyError as e:
-        print("保存chunks 或 embedding 失败：", repr(e))
+        logger.error(f"保存chunks 或 embedding 失败：{e!r}")
         traceback.print_exc()
         db.rollback()
         return None
@@ -2165,15 +2015,15 @@ def delete_chunks_by_id(db, document_id: int):
 # 检索函数
 # ═══════════════════════════════════════════════════════════════
 
-def semantic_search_chunks(db, question: str, limit: int = 5, document_id: int | None = None):
-    """语义检索：使用 BGE query instruction 前缀增强查询质量"""
+def semantic_search_chunks(db, question: str, limit: int = 5, document_ids: list[int] | None = None):
+    """语义检索：支持多标准"""
     question_embedding = services.embedding_service.generate_query_embedding(question)
 
     query = db.query(DocumentChunk).filter(
         DocumentChunk.embedding.isnot(None)
     )
-    if document_id is not None:
-        query = query.filter(DocumentChunk.document_id == document_id)
+    if document_ids:
+        query = query.filter(DocumentChunk.document_id.in_(document_ids))
     chunks = query.all()
     scored_chunks = []
 
@@ -2316,8 +2166,8 @@ def extract_search_terms(question: str) -> list[str]:
     return deduped
 
 
-def extract_keyword_terms(db, terms: list[str], limit: int = 5, document_id: int | None = None):
-    """多关键词 OR 检索"""
+def extract_keyword_terms(db, terms: list[str], limit: int = 5, document_ids: list[int] | None = None):
+    """多关键词 OR 检索，支持多标准"""
     conditions = []
     for term in terms:
         if term and term.strip():
@@ -2327,8 +2177,8 @@ def extract_keyword_terms(db, terms: list[str], limit: int = 5, document_id: int
         return []
 
     query = db.query(DocumentChunk).filter(or_(*conditions))
-    if document_id is not None:
-        query = query.filter(DocumentChunk.document_id == document_id)
+    if document_ids:
+        query = query.filter(DocumentChunk.document_id.in_(document_ids))
     return query.limit(limit).all()
 
 
@@ -2394,7 +2244,7 @@ def _compute_idf_weights(db, force_refresh: bool = False) -> dict[str, float]:
     if not force_refresh and _idf_cache is not None and _idf_cache_chunk_count == total_chunks:
         return _idf_cache
 
-    print(f"[IDF] 重新计算 IDF 权重 ({total_chunks} chunks)...")
+    logger.info(f"重新计算 IDF 权重 ({total_chunks} chunks)...")
 
     # 遍历所有 chunk 建立文档频率
     doc_freq: dict[str, int] = {}
@@ -2420,7 +2270,7 @@ def _compute_idf_weights(db, force_refresh: bool = False) -> dict[str, float]:
 
     _idf_cache = idf
     _idf_cache_chunk_count = total_chunks
-    print(f"[IDF] IDF 缓存已更新，{len(idf)} 个词条")
+    logger.info(f"IDF 缓存已更新，{len(idf)} 个词条")
 
     return idf
 
@@ -2440,18 +2290,17 @@ def _expand_query_synonyms(question: str) -> str:
     return question
 
 
-def hybrid_search_chunks(db, question: str, limit: int = 5, document_id: int | None = None):
+def hybrid_search_chunks(db, question: str, limit: int = 5, document_ids: list[int] | None = None):
     """
     混合检索 v2：IDF加权关键词 + 语义相似度 + RRF 融合 + 置信度分层。
-    返回 (results, confidence) 元组：
-    - results: list[dict] (和原来格式一致)
-    - confidence: "high" | "medium" | "low"
+    支持多标准检索：document_ids=[1,2,3] 时在多个标准中并行检索。
+    返回 (results, confidence) 元组
     """
     terms = extract_search_terms(question)
     idf_weights = _compute_idf_weights(db)
 
     # ── 关键词检索（IDF 加权 + 多因子评分）──
-    keyword_chunks = extract_keyword_terms(db, terms, limit * 3, document_id=document_id)
+    keyword_chunks = extract_keyword_terms(db, terms, limit * 3, document_ids=document_ids)
 
     # 建立关键词排名（用于 RRF）
     kw_ranked = {}  # chunk_id -> rank (1-based)
@@ -2518,7 +2367,7 @@ def hybrid_search_chunks(db, question: str, limit: int = 5, document_id: int | N
         kw_ranked[item["chunk"].id] = rank
 
     # ── 语义检索 ──
-    semantic_results = semantic_search_chunks(db, question, limit * 3, document_id=document_id)
+    semantic_results = semantic_search_chunks(db, question, limit * 3, document_ids=document_ids)
     sem_ranked = {}  # chunk_id -> rank
     sem_scored = {}  # chunk_id -> item
 
@@ -2880,3 +2729,187 @@ def recommend_related_standards(
         recommendations[key] = unique
 
     return recommendations
+
+
+# ═══════════════════════════════════════════════════════════════
+# Grounded Evidence Extraction — 三层防御（防幻觉）
+# ═══════════════════════════════════════════════════════════════
+
+def _split_sentences_zh(text: str) -> list[str]:
+    """拆分中文句子，保护编号中的小数点（如 3.3.1 不会在中间断开）"""
+    # 临时保护数字中的小数点
+    text = re.sub(r'(\d)\.(\d)', r'\1__DOT__\2', text)
+    # 按中文标点切分（。！？；）
+    parts = re.split(r'(?<=[。！？；])\s*', text)
+    result = []
+    for part in parts:
+        part = part.replace('__DOT__', '.').strip()
+        if part and len(part) >= 8:
+            result.append(part)
+    return result
+
+
+def extract_evidence_sentences(question: str, references: list[dict],
+                                similarity_threshold: float = 0.45) -> list[dict]:
+    """
+    层1：从检索到的 reference chunks 中抽取与问题最相关的证据句子（非LLM）。
+
+    流程：
+    1. 将每个 reference 的 content 按句子拆分
+    2. 批量计算所有句子与 question 的余弦相似度
+    3. 保留相似度 > threshold 的句子
+    4. 每句标注来源元数据
+
+    返回: [{"sentence_id": int, "text": str, "similarity": float,
+            "chunk_index": int, "document_id": int, "section_number": str,
+            "section_path": str, "page_number": int, "chunk_type": str,
+            "filename": str}, ...]
+    """
+    if not references or not question:
+        return []
+
+    # 1. 拆分所有句子
+    all_sentences = []
+    for ri, ref in enumerate(references):
+        content = ref.get("content", "")
+        if not content:
+            continue
+        sentences = _split_sentences_zh(content)
+        for si, sent in enumerate(sentences):
+            all_sentences.append({
+                "text": sent,
+                "ref_index": ri,
+                "local_index": si,
+                "document_id": ref.get("document_id"),
+                "chunk_index": ref.get("chunk_index"),
+                "section_number": ref.get("section_number"),
+                "section_path": ref.get("section_path"),
+                "page_number": ref.get("page_number"),
+                "chunk_type": ref.get("chunk_type"),
+                "filename": ref.get("filename"),
+            })
+
+    if not all_sentences:
+        return []
+
+    # 2. 批量计算相似度
+    from services import embedding_service
+    q_embedding = embedding_service.generate_query_embedding(question)
+    sent_texts = [s["text"] for s in all_sentences]
+    sent_embeddings = embedding_service.generate_embeddings_batch(sent_texts)
+
+    # 3. 筛选（带降级：主阈值 0.45 无结果时降到 0.35）
+    for attempt_threshold in (similarity_threshold, similarity_threshold - 0.10):
+        results = []
+        for idx, (emb, sent) in enumerate(zip(sent_embeddings, all_sentences)):
+            sim = embedding_service.cosine_similarity(q_embedding, emb)
+            if sim >= attempt_threshold:
+                results.append({
+                    "sentence_id": idx,
+                    "text": sent["text"],
+                    "similarity": round(sim, 4),
+                    "document_id": sent["document_id"],
+                    "chunk_index": sent["chunk_index"],
+                    "section_number": sent["section_number"],
+                    "section_path": sent["section_path"],
+                    "page_number": sent["page_number"],
+                    "chunk_type": sent["chunk_type"],
+                    "filename": sent["filename"],
+                })
+        if results:
+            results.sort(key=lambda x: x["similarity"], reverse=True)
+            return results[:30]
+    return []
+
+
+def assemble_verified_answer(selection: dict, sentences: list[dict]) -> dict:
+    """
+    层3：根据 LLM 选择的句子组装最终答案，逐句验证可追溯到原文。
+
+    参数:
+      selection: LLM 返回的选择结果 {"selected": [...], "not_found": [...], "summary": "..."}
+      sentences: 层1 抽取的证据句子列表
+
+    返回: {"answer": str, "verified": bool, "citations": [...], "not_found": [...],
+            "evidence_count": int, "selected_count": int}
+    """
+    sent_map = {s["sentence_id"]: s for s in sentences}
+    selected = selection.get("selected", [])
+    not_found = selection.get("not_found", [])
+    summary = selection.get("summary", "")
+
+    if not selected and not summary:
+        return {
+            "answer": "当前资料中未找到与该问题直接相关的内容。建议：1) 尝试用更具体的术语重新提问 2) 确认相关标准文件已上传。",
+            "verified": True,
+            "citations": [],
+            "not_found": not_found,
+            "evidence_count": len(sentences),
+            "selected_count": 0,
+        }
+
+    # 组装
+    parts = []
+    citations = []
+
+    for item in selected:
+        sid = item.get("sentence_id")
+        if sid is None:
+            continue
+        sent = sent_map.get(sid)
+        if sent is None:
+            continue
+
+        text = sent["text"]
+        relevance = item.get("relevance", "")
+
+        # 构建来源标记
+        source_parts = []
+        if sent.get("section_number"):
+            source_parts.append("第{}条".format(sent["section_number"]))
+        if sent.get("section_path"):
+            source_parts.append(sent["section_path"])
+        if sent.get("page_number"):
+            source_parts.append("第{}页".format(sent["page_number"]))
+        source = "「{}」".format(" | ".join(source_parts)) if source_parts else ""
+
+        parts.append({
+            "text": text,
+            "source": source,
+            "relevance": relevance,
+        })
+        citations.append({
+            "sentence_id": sid,
+            "text": text,
+            "section_path": sent.get("section_path"),
+            "section_number": sent.get("section_number"),
+            "page_number": sent.get("page_number"),
+            "document_id": sent.get("document_id"),
+            "chunk_index": sent.get("chunk_index"),
+            "filename": sent.get("filename"),
+            "similarity": sent.get("similarity"),
+            "relevance": relevance,
+        })
+
+    # 构建最终答案
+    answer = ""
+    if summary:
+        answer += "**📋 检索摘要：**{}\n\n---\n\n".format(summary)
+
+    for i, part in enumerate(parts):
+        answer += "**{}** {} {}\n\n".format(i + 1, part["text"], part["source"])
+
+    if not_found:
+        answer += "---\n**⚠️ 当前资料中未找到以下信息：**\n"
+        for nf in not_found:
+            answer += "- {}\n".format(nf)
+        answer += "\n建议核实原文或上传更完整的标准文件。"
+
+    return {
+        "answer": answer,
+        "verified": True,
+        "citations": citations,
+        "not_found": not_found,
+        "evidence_count": len(sentences),
+        "selected_count": len(parts),
+    }

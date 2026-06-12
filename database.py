@@ -1,11 +1,12 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker,declarative_base
+from config import settings
 
-# 1. 数据库连接地址 DATABASE_URL
-DATABASE_URL = "mysql+pymysql://root:123456@127.0.0.1:3306/standard_ai?charset=utf8mb4"
+# 1. 数据库连接地址（从 .env 读取）
+DATABASE_URL = settings.DATABASE_URL
 
 # 2. 创建 engine
-engine = create_engine(DATABASE_URL) #引擎
+engine = create_engine(DATABASE_URL, pool_size=10, max_overflow=20, pool_recycle=3600)
 
 # 3. 创建 SessionLocal
 SessionLocal = sessionmaker( #会话工厂

@@ -98,6 +98,6 @@ class DocumentSearchResponse(BaseModel):
     documents: list[DocumentSearchItemOut]
 
 class AskQuestion(BaseModel):
-    document_id: int | None = None
+    document_ids: list[int] | None = None  # 支持多标准对比，空=全库
     question: str
     limit: int = 5

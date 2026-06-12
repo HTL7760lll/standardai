@@ -7,10 +7,10 @@ from sqlalchemy.orm import Session
 from database import get_db
 from fastapi.responses import FileResponse, StreamingResponse
 import json
+import asyncio
 from pathlib import Path
 import services.llm_service
-import services.anaylysis_service
-import services.watchdog_service
+import services.analysis_service
 
 
 router = APIRouter()
@@ -45,29 +45,6 @@ async def upload_document(file: UploadFile = File(...),
         new_document = services.document_service.create_document(db,file.filename,standard_type,industry,tags,filepath)
         if new_document is None:
             raise HTTPException(status_code=500, detail="上传标准文件失败")
-
-        # 自动提取标准编号并注册到标准版本追踪
-        # 策略：先尝试从文件名提取，失败则解析文档封面内容
-        std_num = services.document_service._extract_standard_info(
-            file.filename, file.filename
-        ).get("standard_number", "")
-
-        if not std_num:
-            # 文件名提取失败 → 尝试解析文档内容（前 3000 字含封面）
-            try:
-                parsed_text = services.document_service.parse_document(filepath)
-                if parsed_text and len(parsed_text) > 50:
-                    std_info = services.document_service._extract_standard_info(
-                        parsed_text, file.filename
-                    )
-                    std_num = std_info.get("standard_number", "")
-            except Exception:
-                pass  # 解析失败不阻塞上传
-
-        if std_num:
-            services.watchdog_service.register_standard_version(
-                db, new_document.id, std_num, file.filename, source="user_upload"
-            )
 
         # ── 后端自动切片：上传后立即解析+切片+生成 embedding ──
         chunk_result = None
@@ -225,6 +202,7 @@ def _make_ref(chunk, doc, score, match_type, source_label, priority):
         clean = clean[:limit] + "\n[...内容过长，已截断...]"
     return {
         "document_id": chunk.document_id,
+        "chunk_id": chunk.id,
         "filename": doc.filename if doc else None,
         "chunk_index": chunk.chunk_index,
         "chunk_type": chunk.chunk_type,
@@ -242,25 +220,29 @@ def _make_ref(chunk, doc, score, match_type, source_label, priority):
 
 @router.post("/ask")
 def ask(request:AskQuestion,db: Session = Depends(get_db)):
-    # 自动文档匹配：如果用户未手动限定文档，尝试从问题中识别文档名
-    effective_doc_id = request.document_id
+    # 确定检索范围：支持单文档、多文档对比、全库
+    doc_ids = request.document_ids
+    is_comparison = doc_ids is not None and len(doc_ids) >= 2
     auto_matched_doc = None
-    if effective_doc_id is None:
-        effective_doc_id = services.document_service._match_question_to_documents(db, request.question)
-        if effective_doc_id is not None:
-            auto_matched_doc = services.document_service.get_document_by_id(db, effective_doc_id)
+
+    # 自动文档匹配（仅在未指定文档时）
+    if doc_ids is None:
+        matched_id = services.document_service._match_question_to_documents(db, request.question)
+        if matched_id is not None:
+            doc_ids = [matched_id]
+            auto_matched_doc = services.document_service.get_document_by_id(db, matched_id)
 
     results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
-        db, request.question, request.limit, document_id=effective_doc_id
+        db, request.question, request.limit, document_ids=doc_ids
     )
 
     # 自动匹配回退：如果限定文档无结果，回退到全库搜索
     auto_match_fallback = False
-    if len(results) == 0 and effective_doc_id is not None and request.document_id is None:
+    if len(results) == 0 and doc_ids is not None and request.document_ids is None:
         auto_match_fallback = True
-        effective_doc_id = None
+        doc_ids = None
         results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
-            db, request.question, request.limit, document_id=None
+            db, request.question, request.limit, document_ids=None
         )
 
     # 零结果查询扩展：用简化查询重试一次
@@ -268,7 +250,7 @@ def ask(request:AskQuestion,db: Session = Depends(get_db)):
         expanded_q = services.document_service._expand_query_synonyms(request.question)
         if expanded_q != request.question:
             results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
-                db, expanded_q, request.limit, document_id=effective_doc_id
+                db, expanded_q, request.limit, document_ids=doc_ids
             )
 
     search_terms = services.document_service.extract_search_terms(request.question)
@@ -293,20 +275,29 @@ def ask(request:AskQuestion,db: Session = Depends(get_db)):
             "prompt_preview": None,
         }
 
-    # 低置信度检索 → 直接返回提示，不传 LLM（过滤掉不可信结果）
-    if confidence == "low":
+    # ═══ Grounded Evidence Extraction 三层防御 ═══
+
+    # 层1：从 references 抽取与问题最相关的证据句子
+    evidence_sentences = services.document_service.extract_evidence_sentences(
+        request.question, references
+    )
+
+    if not evidence_sentences:
+        # 有 references 但无足够相似的句子 → 诚实告知
         return {
             "question": request.question,
+            "question_intent": question_intent,
+            "search_terms": search_terms,
             "answer": (
-                "检索结果可信度较低，未找到与问题高度匹配的内容。"
-                "建议：1) 尝试使用更具体的术语提问 2) 确认相关标准文件已上传并生成切片 3) 尝试引用标准编号查询。"
+                "当前资料中未找到与该问题直接相关的具体内容。\n\n"
+                "建议：1) 尝试使用标准中出现的术语重新提问 2) 确认已上传相关标准文件 3) 尝试扩大检索范围。"
             ),
             "references": [{
                 "document_id": r["document_id"],
                 "filename": r["filename"],
                 "chunk_index": r["chunk_index"],
                 "chunk_type": r["chunk_type"],
-                "chunk_type_cn": _CHUNK_TYPE_CN.get(r["chunk_type"], r["chunk_type"] or "未知"),
+                "chunk_type_cn": r["chunk_type_cn"],
                 "section_path": r["section_path"],
                 "page_number": r["page_number"],
                 "score": r["score"],
@@ -315,95 +306,35 @@ def ask(request:AskQuestion,db: Session = Depends(get_db)):
                 "match_type": r["match_type"],
                 "source_label": r["source_label"],
             } for r in references],
-            "retrieval_confidence": "low",
+            "retrieval_confidence": confidence,
             "confidence_detail": confidence_detail,
             "auto_matched_document": {
                 "document_id": auto_matched_doc.id,
                 "filename": auto_matched_doc.filename,
             } if auto_matched_doc else None,
             "auto_match_fallback": auto_match_fallback,
-            "prompt_preview": None,
+            "evidence_count": 0,
+            "selected_count": 0,
         }
 
-    # ── 结构化 Context ──
-    context_parts = []
-    for index, ref in enumerate(references):
-        ctx = "【资料 {} — {}】".format(index + 1, ref["source_label"])
-        if ref["match_type"] != "linked":
-            ctx += "（{}匹配 | 相关度 {:.2f}）".format(ref["match_type"], ref["score"])
-        ctx += "\n"
-        ctx += "  类型：{}".format(ref["chunk_type_cn"])
-        if ref["chunk_type"]:
-            ctx += "（{}）".format(ref["chunk_type"])
-        ctx += "\n"
-        if ref["section_path"]:
-            ctx += "  章节路径：{}\n".format(ref["section_path"])
-        if ref["page_number"]:
-            ctx += "  页码：第 {} 页\n".format(ref["page_number"])
-        ctx += "  ---\n"
-        ctx += "  {}".format(ref["content"])
-        context_parts.append(ctx)
+    # 层2：LLM 从候选句子中选择相关句子并排序（JSON 结构化输出）
+    selection = services.llm_service.select_evidence_sentences(
+        request.question, evidence_sentences
+    )
 
-    context_text = "\n\n".join(context_parts)
+    # 层3：组装最终答案 + 逐句验证来源可追溯
+    assembled = services.document_service.assemble_verified_answer(
+        selection, evidence_sentences
+    )
 
-    # ── 意图提示 ──
-    intent_hint = ""
-    if question_intent == "scope":
-        intent_hint = "【提示：用户意图是问适用范围/适用对象，优先参考类型为 范围（scope） 的资料】\n"
-    elif question_intent == "definition":
-        intent_hint = "【提示：用户意图是问定义/术语含义，优先参考类型为 术语定义（term） 的资料】\n"
-    elif question_intent == "requirement":
-        intent_hint = "【提示：用户意图是问具体要求/指标/参数，优先参考类型为 正文条款（clause）、表格（table） 的资料】\n"
-    elif question_intent == "references":
-        intent_hint = "【提示：用户意图是问引用了哪些标准/规范性引用文件，优先参考类型为 规范性引用文件（references） 的资料，逐条列出所有引用的标准编号和名称】\n"
-    elif question_intent == "clause_number":
-        intent_hint = "【提示：用户指定了具体条款编号，请优先定位到对应章节路径的正文条款（clause），逐字引用原文内容】\n"
-
-    # ── Prompt (增强版: 强制条款引用 + 原文摘录 + 实例化) ──
-    prompt = (
-        "你是一个专业的企业标准文档问答助手。请严格根据【参考资料】回答用户问题。\n"
-        "如果参考资料中没有答案，请明确回答：资料中未找到相关答案。\n"
-        "不要编造资料中没有的信息。\n\n"
-        "【资料格式说明】\n"
-        "- 类型：告知该资料在文档中的角色（封面/前言/范围/引用文件/术语定义/正文条款/表格/图示/附录）\n"
-        "- 章节路径：用 \">\" 分隔的条款层级路径，用于精确引用条款编号\n"
-        "- 页码：原始文档的物理页码\n"
-        "- \"直接命中\" = 与问题直接匹配（优先作为答案核心）；\"关联上下文-父级\" = 联动提供的上级条款\n"
-        "- \"关联上下文-子级\" = 联动提供的下级条款（补充细节）\n\n"
-        "【回答要求——必须严格遵守】\n"
-        "1. 每个结论必须明确引用章节路径中的条款编号（如\"根据 6.1.1 条款\"），不要只写切片序号\n"
-        "2. 关键条款必须摘录原文关键句，用「」括起来展示给用户，如：原文规定「喷淋头间距不应大于3.6m」\n"
-        "3. 涉及数值/参数/条件/指标时，必须逐一列出具体数值，禁止笼统概括为\"应符合相关要求\"\n"
-        "4. 对于抽象规定，给出一个具体的应用场景举例帮助用户理解\n"
-        "5. 直接命中的资料优先采用作为答案核心，关联上下文用于补充理解和确保完整性\n"
-        "6. 表格类资料需解读数据含义，不要仅复述表格原文\n"
-        "7. 如果某条款有例外条件或适用限制，务必一并说明\n"
-        "8. 回答要分层次：先一句话概括结论 → 再逐条展开细节（用 ①②③ 编号）\n"
-        "9. 如果参考资料不足，明确说\"当前资料中未找到相关答案\"\n"
-        "10. 如果问的是引用文件，必须逐条列出所有被引用的标准编号和标准名称，不能遗漏\n\n"
-        "【示例——你应该这样回答】\n"
-        "用户问：消防喷淋安装间距要求是什么？\n"
-        "✅ 正确的回答格式：\n"
-        "根据当前标准第 6.1.1 条（喷淋头布置间距），原文规定「标准覆盖面积喷头的布置间距不应小于1.8m，且不应大于3.6m」。\n"
-        "同时第 6.1.2 条补充了例外情况：\n"
-        "① 当安装高度超过8m时，间距上限调整为3.0m\n"
-        "② 在有障碍物遮挡的区域，间距应适当减小\n"
-        "③ 具体场景举例：在净高10m的仓库中，喷淋间距不得超过3.0m，建议采用2.8-3.0m的间距布置\n\n"
-        "{intent_hint}"
-        "用户问题：\n{question}\n\n"
-        "参考资料：\n{context_text}"
-    ).format(intent_hint=intent_hint, question=request.question, context_text=context_text)
-
-    answer = services.llm_service.generate_answer(prompt)
-
-    # ── 生成追问建议（基于回答内容推断）──
+    # ── 追问建议 ──
     follow_up_questions = _generate_follow_ups(request.question, question_intent, references)
 
-    # ── 相关标准推荐（如有指定文档）──
+    # ── 相关标准推荐（仅单文档模式下推荐）──
     recommendations = None
-    if request.document_id:
+    if not is_comparison and doc_ids and len(doc_ids) == 1:
         recommendations = services.document_service.recommend_related_standards(
-            db, request.document_id, request.question
+            db, doc_ids[0], request.question
         )
 
     return {
@@ -411,7 +342,7 @@ def ask(request:AskQuestion,db: Session = Depends(get_db)):
         "question_intent": question_intent,
         "search_mode": "hybrid",
         "search_terms": search_terms,
-        "answer": answer,
+        "answer": assembled["answer"],
         "references": [{
             "document_id": r["document_id"],
             "filename": r["filename"],
@@ -426,16 +357,21 @@ def ask(request:AskQuestion,db: Session = Depends(get_db)):
             "match_type": r["match_type"],
             "source_label": r["source_label"],
         } for r in references],
+        "citations": assembled.get("citations", []),
+        "not_found": assembled.get("not_found", []),
+        "evidence_count": assembled.get("evidence_count", 0),
+        "selected_count": assembled.get("selected_count", 0),
         "follow_up_questions": follow_up_questions,
         "recommendations": recommendations,
         "retrieval_confidence": confidence,
         "confidence_detail": confidence_detail,
+        "is_comparison": is_comparison,
+        "comparison_count": len(doc_ids) if doc_ids else 0,
         "auto_matched_document": {
             "document_id": auto_matched_doc.id,
             "filename": auto_matched_doc.filename,
         } if auto_matched_doc else None,
         "auto_match_fallback": auto_match_fallback,
-        "prompt_preview": None,
     }
 
 
@@ -446,25 +382,26 @@ async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
     先推送检索元信息（references + recommendations），再逐 token 推送 LLM 生成内容。
     """
     # ── 0. 自动文档匹配 ──
-    effective_doc_id = request.document_id
+    doc_ids = request.document_ids
     auto_matched_doc = None
-    if effective_doc_id is None:
-        effective_doc_id = services.document_service._match_question_to_documents(db, request.question)
-        if effective_doc_id is not None:
-            auto_matched_doc = services.document_service.get_document_by_id(db, effective_doc_id)
+    if doc_ids is None:
+        matched_id = services.document_service._match_question_to_documents(db, request.question)
+        if matched_id is not None:
+            doc_ids = [matched_id]
+            auto_matched_doc = services.document_service.get_document_by_id(db, matched_id)
 
     # ── 1. 检索阶段（同步，和 /ask 逻辑一致）──
     results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
-        db, request.question, request.limit, document_id=effective_doc_id
+        db, request.question, request.limit, document_ids=doc_ids
     )
 
     # 自动匹配回退：如果限定文档无结果，回退到全库搜索
     auto_match_fallback = False
-    if len(results) == 0 and effective_doc_id is not None and request.document_id is None:
+    if len(results) == 0 and doc_ids is not None and request.document_ids is None:
         auto_match_fallback = True
-        effective_doc_id = None
+        doc_ids = None
         results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
-            db, request.question, request.limit, document_id=None
+            db, request.question, request.limit, document_ids=None
         )
 
     # 零结果查询扩展
@@ -472,7 +409,7 @@ async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
         expanded_q = services.document_service._expand_query_synonyms(request.question)
         if expanded_q != request.question:
             results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
-                db, expanded_q, request.limit, document_id=effective_doc_id
+                db, expanded_q, request.limit, document_ids=doc_ids
             )
 
     search_terms = services.document_service.extract_search_terms(request.question)
@@ -504,109 +441,18 @@ async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
 
         return StreamingResponse(empty_stream(), media_type="text/event-stream")
 
-    # 低置信度检索 → SSE 返回提示
-    if confidence == "low":
-        async def low_conf_stream():
-            yield "data: {}\n\n".format(json.dumps({
-                "type": "meta",
-                "references": [{
-                    "document_id": r["document_id"],
-                    "filename": r["filename"],
-                    "chunk_index": r["chunk_index"],
-                    "chunk_type": r["chunk_type"],
-                    "chunk_type_cn": _CHUNK_TYPE_CN.get(r["chunk_type"], r["chunk_type"] or "未知"),
-                    "section_path": r["section_path"],
-                    "page_number": r["page_number"],
-                    "score": r["score"],
-                    "content_preview": r["content"][:300],
-                    "content_length": r["content_length"],
-                    "match_type": r["match_type"],
-                    "source_label": r["source_label"],
-                } for r in references],
-                "recommendations": None,
-                "follow_up_questions": [],
-                "retrieval_confidence": "low",
-                "confidence_detail": confidence_detail,
-                "auto_matched_document": {
-                    "document_id": auto_matched_doc.id,
-                    "filename": auto_matched_doc.filename,
-                } if auto_matched_doc else None,
-                "auto_match_fallback": auto_match_fallback,
-            }, ensure_ascii=False))
-            yield "data: {}\n\n".format(json.dumps({
-                "type": "answer",
-                "content": (
-                    "检索结果可信度较低，未找到与问题高度匹配的内容。"
-                    "建议：1) 尝试使用更具体的术语提问 2) 确认相关标准文件已上传并生成切片 3) 尝试引用标准编号查询。"
-                ),
-            }, ensure_ascii=False))
-            yield "data: {}\n\n".format(json.dumps({"type": "done"}))
+    # ═══ Grounded Evidence Extraction 三层防御（流式版）═══
 
-        return StreamingResponse(low_conf_stream(), media_type="text/event-stream")
+    # 层1：抽取证据句子
+    evidence_sentences = services.document_service.extract_evidence_sentences(
+        request.question, references
+    )
 
-    # ── 2. 构建 context 和 prompt ──
-    context_parts = []
-    for index, ref in enumerate(references):
-        ctx = "【资料 {} — {}】".format(index + 1, ref["source_label"])
-        if ref["match_type"] != "linked":
-            ctx += "（{}匹配 | 相关度 {:.2f}）".format(ref["match_type"], ref["score"])
-        ctx += "\n"
-        ctx += "  类型：{}".format(ref["chunk_type_cn"])
-        if ref["chunk_type"]:
-            ctx += "（{}）".format(ref["chunk_type"])
-        ctx += "\n"
-        if ref["section_path"]:
-            ctx += "  章节路径：{}\n".format(ref["section_path"])
-        if ref["page_number"]:
-            ctx += "  页码：第 {} 页\n".format(ref["page_number"])
-        ctx += "  ---\n"
-        ctx += "  {}".format(ref["content"])
-        context_parts.append(ctx)
-
-    context_text = "\n\n".join(context_parts)
-
-    intent_hint = ""
-    if question_intent == "scope":
-        intent_hint = "【提示：用户意图是问适用范围/适用对象，优先参考类型为 范围（scope） 的资料】\n"
-    elif question_intent == "definition":
-        intent_hint = "【提示：用户意图是问定义/术语含义，优先参考类型为 术语定义（term） 的资料】\n"
-    elif question_intent == "requirement":
-        intent_hint = "【提示：用户意图是问具体要求/指标/参数，优先参考类型为 正文条款（clause）、表格（table） 的资料】\n"
-    elif question_intent == "references":
-        intent_hint = "【提示：用户意图是问引用了哪些标准/规范性引用文件，优先参考类型为 规范性引用文件（references） 的资料，逐条列出所有引用的标准编号和名称】\n"
-    elif question_intent == "clause_number":
-        intent_hint = "【提示：用户指定了具体条款编号，请优先定位到对应章节路径的正文条款（clause），逐字引用原文内容】\n"
-
-    prompt = (
-        "你是一个专业的企业标准文档问答助手。请严格根据【参考资料】回答用户问题。\n"
-        "如果参考资料中没有答案，请明确回答：资料中未找到相关答案。\n"
-        "不要编造资料中没有的信息。\n\n"
-        "【资料格式说明】\n"
-        "- 类型：告知该资料在文档中的角色（封面/前言/范围/引用文件/术语定义/正文条款/表格/图示/附录）\n"
-        "- 章节路径：用 \">\" 分隔的条款层级路径，用于精确引用条款编号\n"
-        "- 页码：原始文档的物理页码\n"
-        "- \"直接命中\" = 与问题直接匹配（优先作为答案核心）；\"关联上下文-父级\" = 联动提供的上级条款\n"
-        "- \"关联上下文-子级\" = 联动提供的下级条款（补充细节）\n\n"
-        "【回答要求——必须严格遵守】\n"
-        "1. 每个结论必须明确引用章节路径中的条款编号（如\"根据 6.1.1 条款\"），不要只写切片序号\n"
-        "2. 关键条款必须摘录原文关键句，用「」括起来展示给用户\n"
-        "3. 涉及数值/参数/条件/指标时，必须逐一列出具体数值，禁止笼统概括\n"
-        "4. 对于抽象规定，给出一个具体的应用场景举例帮助用户理解\n"
-        "5. 直接命中的资料优先采用作为答案核心，关联上下文用于补充理解和确保完整性\n"
-        "6. 表格类资料需解读数据含义，不要仅复述表格原文\n"
-        "7. 如果某条款有例外条件或适用限制，务必一并说明\n"
-        "8. 回答要分层次：先一句话概括结论 → 再逐条展开细节（用 ①②③ 编号）\n"
-        "9. 如果参考资料不足，明确说\"当前资料中未找到相关答案\"\n\n"
-        "{intent_hint}"
-        "用户问题：\n{question}\n\n"
-        "参考资料：\n{context_text}"
-    ).format(intent_hint=intent_hint, question=request.question, context_text=context_text)
-
-    # ── 3. 推荐 ──
+    # ── 3. 推荐（仅单文档模式）──
     recommendations = None
-    if request.document_id:
+    if doc_ids and len(doc_ids) == 1:
         recommendations = services.document_service.recommend_related_standards(
-            db, request.document_id, request.question
+            db, doc_ids[0], request.question
         )
 
     # ── 4. 追问建议 ──
@@ -645,28 +491,59 @@ async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
         }
         yield "data: {}\n\n".format(json.dumps(meta, ensure_ascii=False))
 
-        # 流式推送 LLM token
-        full_answer = ""
-        try:
-            stream = services.llm_service.generate_answer_stream(prompt)
-            for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    token = chunk.choices[0].delta.content
-                    full_answer += token
-                    yield "data: {}\n\n".format(json.dumps({
-                        "type": "token",
-                        "content": token,
-                    }, ensure_ascii=False))
-        except Exception as e:
+        # 无证据句子 → 直接返回提示
+        if not evidence_sentences:
             yield "data: {}\n\n".format(json.dumps({
-                "type": "error",
-                "message": "LLM 生成失败: {}".format(str(e)),
+                "type": "answer",
+                "content": (
+                    "当前资料中未找到与该问题直接相关的具体内容。"
+                    "建议尝试使用标准中出现的术语重新提问，或确认已上传相关标准文件。"
+                ),
             }, ensure_ascii=False))
+            yield "data: {}\n\n".format(json.dumps({"type": "done"}))
+            return
 
-        # 完成信号
+        # 层2：LLM 选择句子（异步执行，不阻塞事件循环）
+        yield "data: {}\n\n".format(json.dumps({
+            "type": "status",
+            "message": "正在从标准文件中筛选证据...（已找到 {} 个候选句子）".format(len(evidence_sentences)),
+        }, ensure_ascii=False))
+
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        selection = await loop.run_in_executor(
+            None, services.llm_service.select_evidence_sentences,
+            request.question, evidence_sentences
+        )
+
+        # 层3：组装验证
+        assembled = services.document_service.assemble_verified_answer(
+            selection, evidence_sentences
+        )
+
+        # 推送 citations
+        yield "data: {}\n\n".format(json.dumps({
+            "type": "citations",
+            "citations": assembled.get("citations", []),
+            "not_found": assembled.get("not_found", []),
+            "evidence_count": assembled.get("evidence_count", 0),
+            "selected_count": assembled.get("selected_count", 0),
+        }, ensure_ascii=False))
+
+        # 流式推送答案，逐字符模拟真实打字效果
+        answer_text = assembled["answer"]
+        for i, char in enumerate(answer_text):
+            yield "data: {}\n\n".format(json.dumps({
+                "type": "token",
+                "content": char,
+            }, ensure_ascii=False))
+            # 每 3 个字符略微停顿，模拟自然流式输出
+            if i % 3 == 2:
+                await asyncio.sleep(0.02)
+
         yield "data: {}\n\n".format(json.dumps({
             "type": "done",
-            "full_answer_length": len(full_answer),
+            "full_answer_length": len(answer_text),
         }))
 
     return StreamingResponse(
@@ -833,7 +710,7 @@ def analyze_document(
     if document is None:
         raise HTTPException(status_code=404, detail="标准文件不存在")
 
-    analysis = services.anaylysis_service.generate_document_analysis(db,document)
+    analysis = services.analysis_service.generate_document_analysis(db,document)
     if analysis is None:
         raise HTTPException(
             status_code=400,

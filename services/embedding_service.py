@@ -1,16 +1,15 @@
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
 import json
 import sys
+from config import settings
 from sentence_transformers import SentenceTransformer
+
+os.environ["HF_ENDPOINT"] = settings.HF_ENDPOINT
 
 _model = None
 _model_load_error = None
 
-# 当前使用的 embedding 模型
-# 备选: "BAAI/bge-large-zh-v1.5" (1024 token, 中文专用, 需要 sentence-transformers>=3.0 且 transformers 兼容)
-EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDING_MODEL_NAME = settings.EMBEDDING_MODEL
 # BGE 模型检索任务 instruction 前缀（仅 BGE 模型使用）
 BGE_RETRIEVAL_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
 
@@ -59,6 +58,19 @@ def generate_query_embedding(question: str) -> list[float]:
         return embedding.tolist()
     except Exception as e:
         print(f"[Embedding] 生成查询 embedding 失败: {e}", file=sys.stderr)
+        raise
+
+
+def generate_embeddings_batch(texts: list[str]) -> list[list[float]]:
+    """批量生成嵌入向量（用于证据句子抽取等场景）"""
+    if not texts:
+        return []
+    try:
+        model = get_model()
+        embeddings = model.encode(texts, batch_size=32, show_progress_bar=False)
+        return embeddings.tolist()
+    except Exception as e:
+        print(f"[Embedding] 批量生成 embedding 失败: {e}", file=sys.stderr)
         raise
 
 

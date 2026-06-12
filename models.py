@@ -58,43 +58,6 @@ class DocumentAnalysis(Base):
     created_at = Column(DateTime, default=datetime.now)
 
 
-# ── 标准动态监控 ──
-
-class StandardVersion(Base):
-    """标准版本追踪表"""
-    __tablename__ = "standard_versions"
-
-    id = Column(Integer, primary_key=True, index=True)
-    standard_number = Column(String(100), nullable=False, index=True)  # 如 GB/T 46350
-    standard_name = Column(String(300), nullable=True)
-    version_year = Column(String(10), nullable=True)  # 发布年份 2025
-    document_id = Column(Integer, nullable=True, index=True)  # 关联库内文件
-    status = Column(String(20), default="unknown", index=True)  # active/expiring/replaced/abolished/unknown
-    replaced_by_number = Column(String(100), nullable=True)  # 替代标准编号
-    replaced_by_name = Column(String(300), nullable=True)  # 替代标准名称
-    publish_date = Column(DateTime, nullable=True)
-    effective_date = Column(DateTime, nullable=True)
-    expire_date = Column(DateTime, nullable=True)
-    source = Column(String(30), default="user_upload")  # user_upload / official_crawl / manual
-    last_checked = Column(DateTime, nullable=True)
-    check_result = Column(Text, nullable=True)  # 上次检查的原始结果 JSON
-    created_at = Column(DateTime, default=datetime.now)
-    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-
-
-class StandardStatusLog(Base):
-    """标准状态变更日志"""
-    __tablename__ = "standard_status_log"
-
-    id = Column(Integer, primary_key=True, index=True)
-    standard_version_id = Column(Integer, nullable=False, index=True)
-    from_status = Column(String(20), nullable=True)
-    to_status = Column(String(20), nullable=False)
-    change_reason = Column(Text, nullable=True)
-    triggered_by = Column(String(30), default="system")  # system / admin / user
-    created_at = Column(DateTime, default=datetime.now)
-
-
 # ── OCR 缓存 ──
 
 class OcrResultCache(Base):

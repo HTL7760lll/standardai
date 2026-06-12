@@ -78,27 +78,6 @@ export async function* askStream(payload) {
   }
 }
 
-// ── 标准动态监控 ──
-export function getStandardsStatus(params = {}) {
-  return api.get('/standards/watchdog', { params })
-}
-
-export function getStandardDetail(versionId) {
-  return api.get(`/standards/watchdog/${versionId}`)
-}
-
-export function triggerStandardCheck(versionId) {
-  return api.post(`/standards/watchdog/${versionId}/check`)
-}
-
-export function triggerBatchCheck() {
-  return api.post('/standards/watchdog/batch-check')
-}
-
-export function updateStandardStatus(versionId, params) {
-  return api.patch(`/standards/watchdog/${versionId}/status`, null, { params })
-}
-
 // ── 统计 ──
 export function getDocumentStats() {
   return api.get('/documents/stats')
@@ -106,6 +85,10 @@ export function getDocumentStats() {
 
 export function searchDocuments(keyword, page = 1, pageSize = 5) {
   return api.get('/documents/search', { params: { keyword, page, page_size: pageSize } })
+}
+
+export function deleteDocument(documentId) {
+  return api.delete(`/documents/${documentId}`)
 }
 
 export default api
