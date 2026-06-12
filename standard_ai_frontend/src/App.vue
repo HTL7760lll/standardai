@@ -49,61 +49,37 @@
               ⚠️ 检测到您可能想问「{{ msg.autoMatched.filename }}」，但该文档暂未生成切片，已切换至全库搜索。<br/>
               <span style="font-size:12px;">提示：请先到文档库对该文档点击"分析"生成切片后重试。</span>
             </div>
-            <!-- 对比模式标签 -->
-            <div v-if="msg.role === 'ai' && msg.isComparison && !msg.streaming" class="comparison-banner">
-              🔍 对比模式：已同时检索 {{ msg.comparisonCount }} 份标准，回答综合了以下标准的条款
-            </div>
-            </div>
 
             <!-- 流式生成中指示 -->
             <div v-if="msg.role === 'ai' && msg.streaming" class="streaming-indicator">
               <span class="streaming-dot"></span> AI 正在生成回答...
             </div>
 
-            <!-- 引用来源（仅 AI 消息，非流式中） -->
+            <!-- 引用来源放在气泡外面（仅 AI 消息，非流式中） -->
             <div v-if="msg.role === 'ai' && !msg.streaming && msg.references && msg.references.length" class="ref-outside">
-              <!-- 对比模式：按标准分组展示 -->
-              <template v-if="msg.isComparison">
-                <div class="ref-toggle-title" style="margin-bottom:10px;">
-                  📎 对比来源 · <span class="ref-count">{{ msg.references.length }} 条</span>
-                  <span class="ref-first">— {{ msg.comparisonCount }} 份标准</span>
-                </div>
-                <div v-for="(group, gIdx) in groupedRefs(msg.references)" :key="gIdx" class="ref-group-box">
-                  <div class="ref-group-label">📋 {{ group.filename }}</div>
-                  <div v-for="(ref, ri) in group.refs" :key="ri" class="ref-outside-item">
-                    <div class="ref-outside-header">
-                      <el-tag size="small" :type="ref.source_label === '直接命中' ? 'success' : 'info'">{{ ref.source_label || '参考' }}</el-tag>
-                      <el-tag size="small" type="warning" v-if="ref.chunk_type_cn">{{ ref.chunk_type_cn }}</el-tag>
-                      <span class="ref-outside-score" v-if="ref.score !== undefined">{{ (ref.score * 100).toFixed(0) }}%</span>
+              <el-collapse>
+                <el-collapse-item>
+                  <template #title>
+                    <div class="ref-toggle-title">
+                      📎 数据来源 ·
+                      <span class="ref-count">{{ msg.references.length }} 条参考资料</span>
+                      <span class="ref-first">— {{ msg.references[0].filename || '未知文件' }}</span>
                     </div>
-                    <div class="ref-section-path" v-if="ref.section_path">📂 {{ ref.section_path }}</div>
+                  </template>
+                  <div v-for="(ref, ri) in msg.references" :key="ri" class="ref-outside-item">
+                    <div class="ref-outside-header">
+                      <el-tag size="small" :type="ref.match_type === 'keyword' ? 'warning' : ref.match_type === 'semantic' ? 'success' : 'info'">
+                        {{ ref.match_type === 'keyword' ? '关键词' : ref.match_type === 'semantic' ? '语义' : ref.match_type === 'hybrid' ? '混合' : '关联' }}
+                      </el-tag>
+                      <span class="ref-outside-file">{{ ref.filename }}</span>
+                      <span class="ref-outside-score" v-if="ref.score !== undefined">
+                        匹配度 {{ (ref.score * 100).toFixed(0) }}%
+                      </span>
+                    </div>
                     <div class="ref-outside-text">{{ ref.content_preview?.substring(0, 250) }}</div>
                   </div>
-                </div>
-              </template>
-              <!-- 单标准模式 -->
-              <template v-else>
-                <el-collapse>
-                  <el-collapse-item>
-                    <template #title>
-                      <div class="ref-toggle-title">
-                        📎 数据来源 · <span class="ref-count">{{ msg.references.length }} 条</span>
-                        <span class="ref-first">— {{ msg.references[0].filename || '未知文件' }}</span>
-                      </div>
-                    </template>
-                    <div v-for="(ref, ri) in msg.references" :key="ri" class="ref-outside-item">
-                      <div class="ref-outside-header">
-                        <el-tag size="small" :type="ref.source_label === '直接命中' ? 'success' : 'info'">{{ ref.source_label || '参考' }}</el-tag>
-                        <el-tag size="small" type="warning" v-if="ref.chunk_type_cn">{{ ref.chunk_type_cn }}</el-tag>
-                        <span class="ref-outside-file">{{ ref.filename }}</span>
-                        <span class="ref-outside-score" v-if="ref.score !== undefined">{{ (ref.score * 100).toFixed(0) }}%</span>
-                      </div>
-                      <div class="ref-section-path" v-if="ref.section_path">📂 {{ ref.section_path }}</div>
-                      <div class="ref-outside-text">{{ ref.content_preview?.substring(0, 250) }}</div>
-                    </div>
-                  </el-collapse-item>
-                </el-collapse>
-              </template>
+                </el-collapse-item>
+              </el-collapse>
             </div>
 
             <!-- 追问建议（仅 AI 消息，非流式中） -->
@@ -164,7 +140,7 @@
                 <span class="limit-label">📚 参考数量</span>
               </el-tooltip>
               <el-input-number v-model="limit" :min="1" :max="20" size="small" controls-position="right" />
-              <el-tooltip content="选择1份=单标准问答；选择2-5份=跨标准对比；不选=全库搜索" placement="top">
+              <el-tooltip content="选1份=单标准；选2-5份=跨标准对比；不选=全库" placement="top">
                 <el-select v-model="askDocIds" placeholder="选择标准（可多选对比）" clearable multiple size="small" style="width: 280px;" :multiple-limit="5" collapse-tags>
                   <el-option v-for="doc in allDocuments" :key="doc.id" :label="doc.filename" :value="doc.id" />
                 </el-select>
@@ -408,7 +384,7 @@ const suggestedQuestions = ref([
   '第1条/第一章主要讲了什么？',
 ])
 
-
+const backfilling = ref(false)
 
 // ── 图表 ──
 const typeChartRef = ref(null)
@@ -470,19 +446,16 @@ async function loadAllDocuments() {
       const res = await getDocuments({ page, page_size: pageSize })
       const docs = res.data.documents || (Array.isArray(res.data) ? res.data : [])
       allDocs = allDocs.concat(docs)
-      if (docs.length < pageSize) break  // 最后一页
+      if (docs.length < pageSize) break
       page++
     }
     allDocuments.value = allDocs
-    console.log('[QA] 已加载 ' + allDocuments.value.length + ' 份标准到选择器')
   } catch (e) {
     console.error('[QA] 加载标准列表失败:', e)
     try {
-      const fallback = await getDocuments({ page: 1, page_size: 100 })
-      allDocuments.value = fallback.data?.documents || []
-    } catch {
-      allDocuments.value = []
-    }
+      const res = await getDocuments({ page: 1, page_size: 100 })
+      allDocuments.value = res.data?.documents || []
+    } catch { allDocuments.value = [] }
   }
 }
 
@@ -622,9 +595,9 @@ async function submitAsk() {
         aiMsg.references = event.references || []
         aiMsg.followUps = event.follow_up_questions || []
         aiMsg.recommendations = event.recommendations || null
-        aiMsg.isComparison = event.is_comparison || false
-        aiMsg.comparisonCount = event.comparison_count || 0
+        // 自动文档匹配：同步 askDocId + 显示提示
         if (event.auto_matched_document) {
+          askDocId.value = event.auto_matched_document.document_id
           aiMsg.autoMatched = event.auto_matched_document
         }
         if (event.auto_match_fallback) {
@@ -659,10 +632,9 @@ function selectRecommendedDoc(rec) {
   if (!askDocIds.value.includes(rec.document_id)) {
     askDocIds.value = [...askDocIds.value, rec.document_id]
   }
-  ElMessage.success('已添加标准: ' + rec.filename + '（下次提问将基于所选标准）')
+  ElMessage.success('已添加标准: ' + rec.filename)
 }
 
-// 将 references 按 document_id 分组（对比模式用）
 function groupedRefs(refs) {
   const groups = {}
   for (const r of refs) {

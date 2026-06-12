@@ -97,6 +97,12 @@ def _is_text_garbled(text: str) -> bool:
     text = text.strip()
     total = len(text)
 
+    # 7. PDF 字形 ID 乱码检测：/G21 /G2A /G1F 等模式
+    # 当 pypdf 无法解码实际文字时，会返回字体字形 ID
+    glyph_patterns = len(re.findall(r'/G[0-9A-Fa-f]{1,3}', text))
+    if glyph_patterns >= 5 and glyph_patterns * 4 >= total * 0.3:
+        return True
+
     chinese = 0
     english_alpha = 0
     digit = 0
@@ -232,8 +238,9 @@ def _ocr_pdf_with_paddle(file_path: str) -> str:
     total_pages = len(doc)
     texts = [None] * total_pages
 
-    # 在主线程中预加载 PaddleOCR（避免 4 个工作线程竞态初始化导致 segfault）
+    # 在主线程中预加载 PaddleOCR + 创建串行锁（PaddleOCR 不是线程安全的）
     _ocr_init_lock = threading.Lock()
+    _ocr_call_lock = threading.Lock()
     with _ocr_init_lock:
         ocr_engine = _get_paddleocr()
     if ocr_engine is None:
@@ -280,14 +287,14 @@ def _ocr_pdf_with_paddle(file_path: str) -> str:
         if cached_text:
             return (page_index, cached_text)
 
-        # 执行 OCR
+        # 执行 OCR（串行化，PaddleOCR 不线程安全）
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_path = tmp.name
             tmp.write(img_bytes)
 
         try:
-            ocr = _get_paddleocr()
-            result = ocr.ocr(tmp_path)
+            with _ocr_call_lock:
+                result = ocr_engine.ocr(tmp_path)
             page_text_parts = []
 
             if result and result[0]:
