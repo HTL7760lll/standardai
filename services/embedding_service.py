@@ -15,28 +15,46 @@ BGE_RETRIEVAL_INSTRUCTION = "为这个句子生成表示以用于检索相关文
 
 
 def get_model():
-    """获取 embedding 模型实例，带异常处理和友好提示"""
+    """获取 embedding 模型实例，带异常处理和自动重试"""
     global _model, _model_load_error
 
     if _model is not None:
         return _model
 
     if _model_load_error is not None:
+        # 不清除错误缓存，避免每次请求都重试下载（消耗网络和 CPU）
         raise _model_load_error
 
-    try:
-        print(f"[Embedding] 正在加载模型 {EMBEDDING_MODEL_NAME}，首次加载可能需要下载...")
-        print("[Embedding] 下载源: https://hf-mirror.com")
-        _model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        print(f"[Embedding] 模型加载完成！最大序列长度: {_model.max_seq_length}")
-    except Exception as e:
-        _model_load_error = RuntimeError(
-            f"Embedding 模型加载失败: {e}\n"
-            "请检查网络连接，或尝试手动下载模型放置到本地。"
-        )
-        raise _model_load_error
+    import time
+    max_retries = 3
+    last_error = None
 
-    return _model
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"[Embedding] 正在加载模型 {EMBEDDING_MODEL_NAME}（尝试 {attempt}/{max_retries}）...")
+            # 优先从本地缓存加载，避免 SSL/网络问题
+            try:
+                _model = SentenceTransformer(EMBEDDING_MODEL_NAME, local_files_only=True)
+                print("[Embedding] 从本地缓存加载模型")
+            except Exception:
+                print("[Embedding] 本地缓存未命中，尝试从网络下载...")
+                print("[Embedding] 下载源: https://hf-mirror.com")
+                _model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+            _model_load_error = None  # 成功后清除错误
+            print(f"[Embedding] 模型加载完成！最大序列长度: {_model.max_seq_length}")
+            return _model
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                wait = 5 * attempt
+                print(f"[Embedding] 加载失败（{e}），{wait}秒后重试...")
+                time.sleep(wait)
+
+    _model_load_error = RuntimeError(
+        f"Embedding 模型加载失败（重试{max_retries}次）: {last_error}\n"
+        "请检查网络连接，或尝试手动下载模型放置到本地。"
+    )
+    raise _model_load_error
 
 
 def generate_embedding(text: str) -> list[float]:

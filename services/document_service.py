@@ -2016,8 +2016,12 @@ def delete_chunks_by_id(db, document_id: int):
 # ═══════════════════════════════════════════════════════════════
 
 def semantic_search_chunks(db, question: str, limit: int = 5, document_ids: list[int] | None = None):
-    """语义检索：支持多标准"""
-    question_embedding = services.embedding_service.generate_query_embedding(question)
+    """语义检索：支持多标准。模型不可用时降级返回空，不阻塞关键词检索。"""
+    try:
+        question_embedding = services.embedding_service.generate_query_embedding(question)
+    except Exception as e:
+        logger.warning(f"语义检索跳过（embedding 模型不可用）: {e}")
+        return []
 
     query = db.query(DocumentChunk).filter(
         DocumentChunk.embedding.isnot(None)
