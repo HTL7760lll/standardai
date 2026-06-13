@@ -3,15 +3,33 @@
     <!-- ═══════════ 登录遮罩 ═══════════ -->
     <div v-if="!loggedIn" class="login-overlay">
       <div class="login-card">
-        <h2>📋 智能标准文档管理系统</h2>
-        <p style="color:#909399;margin-bottom:20px;">请登录后使用</p>
-        <el-input v-model="loginForm.username" placeholder="用户名" size="large" style="margin-bottom:12px;" @keydown.enter="doLogin" />
-        <el-input v-model="loginForm.password" type="password" placeholder="密码" size="large" show-password style="margin-bottom:16px;" @keydown.enter="doLogin" />
-        <el-button type="primary" size="large" :loading="loginLoading" @click="doLogin" style="width:100%;">登 录</el-button>
-        <p v-if="loginError" style="color:#f56c6c;margin-top:10px;text-align:center;">{{ loginError }}</p>
-        <p style="margin-top:16px;text-align:center;font-size:13px;color:#909399;">
-          没有账号？<el-button text type="primary" size="small" @click="doRegister">注册</el-button>
-        </p>
+        <!-- 左侧品牌区 -->
+        <div class="login-brand">
+          <div class="login-brand-icon">📋</div>
+          <div class="login-brand-title">智能标准文档管理</div>
+          <div class="login-brand-sub">与 RAG 问答系统</div>
+          <div class="login-brand-desc">面向标准工程师和研究人员的 AI 助手</div>
+        </div>
+        <!-- 右侧表单区 -->
+        <div class="login-form-panel">
+          <div class="login-tabs">
+            <span :class="['login-tab', { active: loginMode === 'login' }]" @click="loginMode='login';loginError=''">登录</span>
+            <span :class="['login-tab', { active: loginMode === 'register' }]" @click="loginMode='register';loginError=''">注册</span>
+          </div>
+          <el-input v-model="loginForm.username" placeholder="用户名" size="large" style="margin-bottom:16px;">
+            <template #prefix><el-icon><User /></el-icon></template>
+          </el-input>
+          <el-input v-model="loginForm.password" type="password" placeholder="密码" size="large" show-password style="margin-bottom:16px;" @keydown.enter="handleAuth">
+            <template #prefix><el-icon><Lock /></el-icon></template>
+          </el-input>
+          <el-input v-if="loginMode === 'register'" v-model="loginForm.confirm" type="password" placeholder="确认密码" size="large" show-password style="margin-bottom:16px;" @keydown.enter="handleAuth">
+            <template #prefix><el-icon><Lock /></el-icon></template>
+          </el-input>
+          <p v-if="loginError" class="login-error">{{ loginError }}</p>
+          <el-button type="primary" size="large" :loading="loginLoading" @click="handleAuth" style="width:100%;">
+            {{ loginMode === 'login' ? '登 录' : '注 册' }}
+          </el-button>
+        </div>
       </div>
     </div>
 
@@ -408,7 +426,7 @@
 <script setup>
 import { onMounted, reactive, ref, nextTick, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { UploadFilled, Upload, Search } from '@element-plus/icons-vue'
+import { UploadFilled, Upload, Search, User, Lock } from '@element-plus/icons-vue'
 import { askQuestion, askStream, generateChunks, getDocuments, uploadDocument, analyzeDocument, getDocumentStats, searchDocuments, deleteDocument } from './services/api'
 import axios from 'axios'
 import { marked } from 'marked'
@@ -422,13 +440,19 @@ const loggedIn = ref(!!localStorage.getItem('token'))
 const currentUser = ref(localStorage.getItem('username') || '')
 const loginLoading = ref(false)
 const loginError = ref('')
-const loginForm = reactive({ username: '', password: '' })
+const loginMode = ref('login')
+const loginForm = reactive({ username: '', password: '', confirm: '' })
+
+function handleAuth() {
+  if (loginMode.value === 'login') doLogin()
+  else doRegister()
+}
 
 async function doLogin() {
   if (!loginForm.username || !loginForm.password) { loginError.value = '请输入用户名和密码'; return }
   loginLoading.value = true; loginError.value = ''
   try {
-    const res = await axios.post('http://127.0.0.1:8000/auth/login', loginForm)
+    const res = await axios.post('http://127.0.0.1:8000/auth/login', { username: loginForm.username, password: loginForm.password })
     const data = res.data
     localStorage.setItem('token', data.token)
     localStorage.setItem('username', data.username)
@@ -441,11 +465,14 @@ async function doLogin() {
 }
 
 async function doRegister() {
-  if (!loginForm.username || !loginForm.password) { loginError.value = '请输入用户名和密码'; return }
-  if (loginForm.password.length < 4) { loginError.value = '密码至少4位'; return }
+  if (!loginForm.username) { loginError.value = '请输入用户名'; return }
+  if (loginForm.username.length < 2) { loginError.value = '用户名至少2位'; return }
+  if (!loginForm.password) { loginError.value = '请输入密码'; return }
+  if (loginForm.password.length < 6) { loginError.value = '密码至少6位'; return }
+  if (loginForm.password !== loginForm.confirm) { loginError.value = '两次密码不一致'; return }
   loginLoading.value = true; loginError.value = ''
   try {
-    const res = await axios.post('http://127.0.0.1:8000/auth/register', loginForm)
+    const res = await axios.post('http://127.0.0.1:8000/auth/register', { username: loginForm.username, password: loginForm.password })
     const data = res.data
     localStorage.setItem('token', data.token)
     localStorage.setItem('username', data.username)

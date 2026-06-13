@@ -23,8 +23,10 @@ class RegisterRequest(BaseModel):
 
 @router.post("/register")
 def register(req: RegisterRequest, db: Session = Depends(get_db)):
-    if len(req.username) < 2 or len(req.password) < 4:
-        raise HTTPException(400, "用户名至少2位，密码至少4位")
+    if len(req.username) < 2:
+        raise HTTPException(400, "用户名至少2位")
+    if len(req.password) < 6:
+        raise HTTPException(400, "密码至少6位")
     user = auth.create_user(db, req.username, req.password)
     if user is None:
         raise HTTPException(409, "用户名已存在")
@@ -41,6 +43,11 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
         raise HTTPException(401, "用户名或密码错误")
     token = auth.create_token(user.id, user.username, user.role)
     return {"message": "登录成功", "token": token, "username": user.username, "role": user.role}
+
+
+@router.get("/me")
+def get_me(user: User = Depends(get_current_user)):
+    return {"username": user.username, "role": user.role}
 
 
 def get_current_user(db: Session = Depends(get_db), authorization: str | None = None) -> User:

@@ -1,6 +1,8 @@
 from fastapi import APIRouter,HTTPException, Query, Depends,UploadFile,File,Form, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from routers.auth import get_current_user
+from models import User
 
 limiter = Limiter(key_func=get_remote_address)
 from sqlalchemy.exc import SQLAlchemyError
@@ -35,6 +37,7 @@ async def create_document(document: DocumentCreate, db: Session = Depends(get_db
 @router.post("/documents/upload", response_model=DocumentMessageOut)
 @limiter.limit("10/minute")
 async def upload_document(request: Request, file: UploadFile = File(...),
+                          user: User = Depends(get_current_user),
                           standard_type:str =Form(...), #Form是普通字段，因为返回的值是普通字段不是JSON
                           industry:str =Form(...),
                           tags: str = Form(...),
@@ -225,7 +228,8 @@ def _make_ref(chunk, doc, score, match_type, source_label, priority):
 
 @router.post("/ask")
 @limiter.limit("30/minute")
-def ask(req: Request, request:AskQuestion, db: Session = Depends(get_db)):
+def ask(req: Request, request:AskQuestion, db: Session = Depends(get_db),
+        user: User = Depends(get_current_user)):
     # 确定检索范围：支持单文档、多文档对比、全库
     doc_ids = request.document_ids
     is_comparison = doc_ids is not None and len(doc_ids) >= 2
@@ -421,7 +425,8 @@ def ask(req: Request, request:AskQuestion, db: Session = Depends(get_db)):
 
 @router.post("/ask/stream")
 @limiter.limit("30/minute")
-async def ask_stream(req: Request, request: AskQuestion, db: Session = Depends(get_db)):
+async def ask_stream(req: Request, request: AskQuestion, db: Session = Depends(get_db),
+                     user: User = Depends(get_current_user)):
     """
     SSE 流式问答接口。
     先推送检索元信息（references + recommendations），再逐 token 推送 LLM 生成内容。
@@ -749,7 +754,8 @@ async def update_document_by_id(document_id: int, patch_document: DocumentUpdate
 
 @router.delete("/documents/{document_id}", response_model=MessageOut)  # 根据标准文件的id去删除相对应的文件
 async def delete_document_by_id(document_id: int,
-                                db: Session = Depends(get_db)):
+                                db: Session = Depends(get_db),
+                                user: User = Depends(get_current_user)):
     document = services.document_service.get_document_by_id(db,document_id)
     if document is None:
         raise HTTPException(status_code=404, detail="您要删除的标准文件不存在")
@@ -778,7 +784,8 @@ async def download_document(document_id: int,db: Session = Depends(get_db)):
     return FileResponse(path=file_path,filename=document.filename,media_type='application/octet-stream',)
 
 @router.post("/documents/{document_id}/chunks")
-async def chunk_documents(document_id: int,db: Session = Depends(get_db)):
+async def chunk_documents(document_id: int,db: Session = Depends(get_db),
+                          user: User = Depends(get_current_user)):
     document = services.document_service.get_document_by_id(db, document_id)
     if document is None:  # 判断这个文件id在不在数据库
         raise HTTPException(status_code=404, detail="您要的标准文件不存在")
