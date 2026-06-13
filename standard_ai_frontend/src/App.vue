@@ -55,31 +55,53 @@
               <span class="streaming-dot"></span> AI 正在生成回答...
             </div>
 
-            <!-- 引用来源放在气泡外面（仅 AI 消息，非流式中） -->
+            <!-- 对比模式标签 -->
+            <div v-if="msg.role === 'ai' && msg.isComparison && !msg.streaming" class="comparison-banner">
+              🔍 对比模式：已同时检索 {{ msg.comparisonCount }} 份标准
+            </div>
+
+            <!-- 引用来源（仅 AI 消息，非流式中） -->
             <div v-if="msg.role === 'ai' && !msg.streaming && msg.references && msg.references.length" class="ref-outside">
-              <el-collapse>
-                <el-collapse-item>
-                  <template #title>
-                    <div class="ref-toggle-title">
-                      📎 数据来源 ·
-                      <span class="ref-count">{{ msg.references.length }} 条参考资料</span>
-                      <span class="ref-first">— {{ msg.references[0].filename || '未知文件' }}</span>
-                    </div>
-                  </template>
-                  <div v-for="(ref, ri) in msg.references" :key="ri" class="ref-outside-item">
+              <!-- 对比模式：按标准分组 -->
+              <template v-if="msg.isComparison">
+                <div class="ref-toggle-title" style="margin-bottom:8px;">
+                  📎 对比来源 · <span class="ref-count">{{ msg.references.length }} 条</span>
+                  <span class="ref-first">— {{ msg.comparisonCount }} 份标准</span>
+                </div>
+                <div v-for="(group, gIdx) in groupedRefs(msg.references)" :key="gIdx" class="ref-group-box">
+                  <div class="ref-group-label">📋 {{ group.filename }}</div>
+                  <div v-for="(ref, ri) in group.refs" :key="ri" class="ref-outside-item">
                     <div class="ref-outside-header">
-                      <el-tag size="small" :type="ref.match_type === 'keyword' ? 'warning' : ref.match_type === 'semantic' ? 'success' : 'info'">
-                        {{ ref.match_type === 'keyword' ? '关键词' : ref.match_type === 'semantic' ? '语义' : ref.match_type === 'hybrid' ? '混合' : '关联' }}
-                      </el-tag>
-                      <span class="ref-outside-file">{{ ref.filename }}</span>
-                      <span class="ref-outside-score" v-if="ref.score !== undefined">
-                        匹配度 {{ (ref.score * 100).toFixed(0) }}%
-                      </span>
+                      <el-tag size="small" :type="ref.source_label === '直接命中' ? 'success' : 'info'">{{ ref.source_label || '参考' }}</el-tag>
+                      <span class="ref-outside-score" v-if="ref.score !== undefined">{{ (ref.score * 100).toFixed(0) }}%</span>
                     </div>
+                    <div class="ref-section-path" v-if="ref.section_path">📂 {{ ref.section_path }}</div>
                     <div class="ref-outside-text">{{ ref.content_preview?.substring(0, 250) }}</div>
                   </div>
-                </el-collapse-item>
-              </el-collapse>
+                </div>
+              </template>
+              <!-- 单标准模式 -->
+              <template v-else>
+                <el-collapse>
+                  <el-collapse-item>
+                    <template #title>
+                      <div class="ref-toggle-title">
+                        📎 数据来源 · <span class="ref-count">{{ msg.references.length }} 条</span>
+                        <span class="ref-first">— {{ msg.references[0].filename || '未知文件' }}</span>
+                      </div>
+                    </template>
+                    <div v-for="(ref, ri) in msg.references" :key="ri" class="ref-outside-item">
+                      <div class="ref-outside-header">
+                        <el-tag size="small" :type="ref.source_label === '直接命中' ? 'success' : 'info'">{{ ref.source_label || '参考' }}</el-tag>
+                        <span class="ref-outside-file">{{ ref.filename }}</span>
+                        <span class="ref-outside-score" v-if="ref.score !== undefined">{{ (ref.score * 100).toFixed(0) }}%</span>
+                      </div>
+                      <div class="ref-section-path" v-if="ref.section_path">📂 {{ ref.section_path }}</div>
+                      <div class="ref-outside-text">{{ ref.content_preview?.substring(0, 250) }}</div>
+                    </div>
+                  </el-collapse-item>
+                </el-collapse>
+              </template>
             </div>
 
             <!-- 追问建议（仅 AI 消息，非流式中） -->
@@ -595,9 +617,10 @@ async function submitAsk() {
         aiMsg.references = event.references || []
         aiMsg.followUps = event.follow_up_questions || []
         aiMsg.recommendations = event.recommendations || null
-        // 自动文档匹配：同步 askDocId + 显示提示
+        aiMsg.isComparison = event.is_comparison || false
+        aiMsg.comparisonCount = event.comparison_count || 0
         if (event.auto_matched_document) {
-          askDocId.value = event.auto_matched_document.document_id
+          askDocIds.value = [event.auto_matched_document.document_id]
           aiMsg.autoMatched = event.auto_matched_document
         }
         if (event.auto_match_fallback) {
