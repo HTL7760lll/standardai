@@ -780,13 +780,11 @@ def draft_check(document_id: int, req: AskQuestion, db: Session = Depends(get_db
     ctx = services.document_service._format_comparison_context(refs)
 
     # 获取草案条款详情
-    clause_info = ""
-    if req.document_ids:
-        clause_chunks = db.query(DocumentChunk).filter(
-            DocumentChunk.document_id == document_id,
-            DocumentChunk.section_path.isnot(None)
-        ).all()
-        clause_info = "\n".join([f"- {c.section_path}: { (c.content or '')[:200]}" for c in clause_chunks[:5]])
+    clause_chunks = db.query(DocumentChunk).filter(
+        DocumentChunk.document_id == document_id,
+        DocumentChunk.section_path.isnot(None)
+    ).all()
+    clause_info = "\n".join([f"- {c.section_path}: { (c.content or '')[:200]}" for c in clause_chunks[:5]])
 
     prompt = (
         f"你是标准起草审查专家。用户正在起草一份标准，需要检查草案条款是否与现行标准冲突。\n\n"
