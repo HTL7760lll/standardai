@@ -2023,8 +2023,13 @@ def delete_chunks_by_id(db, document_id: int):
     chunks = db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).all()
     try:
         for chunk in chunks:
+            # 先删关联的 chunk_relations
+            from models import ChunkRelation
+            db.query(ChunkRelation).filter(
+                (ChunkRelation.chunk_id == chunk.id) | (ChunkRelation.related_chunk_id == chunk.id)
+            ).delete()
             db.delete(chunk)
-            db.commit()
+        db.commit()
     except SQLAlchemyError:
         db.rollback()
         return False
