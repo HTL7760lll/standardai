@@ -1,7 +1,19 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, JSON,Text
+from sqlalchemy import Column, Integer, String, DateTime, JSON, Text, Boolean
 
 from database import Base
+
+
+# ── 用户模型 ──
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, nullable=False, index=True)
+    password_hash = Column(String(200), nullable=False)
+    role = Column(String(20), default="engineer")  # admin / engineer / viewer
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.now)
 
 # 文件保存模型
 class Document(Base): #定义数据库模型

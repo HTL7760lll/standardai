@@ -1,5 +1,20 @@
 <template>
   <div class="app-shell">
+    <!-- ═══════════ 登录遮罩 ═══════════ -->
+    <div v-if="!loggedIn" class="login-overlay">
+      <div class="login-card">
+        <h2>📋 智能标准文档管理系统</h2>
+        <p style="color:#909399;margin-bottom:20px;">请登录后使用</p>
+        <el-input v-model="loginForm.username" placeholder="用户名" size="large" style="margin-bottom:12px;" @keydown.enter="doLogin" />
+        <el-input v-model="loginForm.password" type="password" placeholder="密码" size="large" show-password style="margin-bottom:16px;" @keydown.enter="doLogin" />
+        <el-button type="primary" size="large" :loading="loginLoading" @click="doLogin" style="width:100%;">登 录</el-button>
+        <p v-if="loginError" style="color:#f56c6c;margin-top:10px;text-align:center;">{{ loginError }}</p>
+        <p style="margin-top:16px;text-align:center;font-size:13px;color:#909399;">
+          没有账号？<el-button text type="primary" size="small" @click="doRegister">注册</el-button>
+        </p>
+      </div>
+    </div>
+
     <!-- ═══════════ 顶部导航栏 ═══════════ -->
     <header class="top-bar">
       <div class="top-bar-left">
@@ -16,6 +31,8 @@
         <a href="https://std.samr.gov.cn/" target="_blank" class="nav-link" title="国家标准全文公开系统">
           🔗 国标公开平台
         </a>
+        <span style="color:#c8d8e8;font-size:13px;margin-left:12px;">👤 {{ currentUser }}</span>
+        <el-button text size="small" style="color:#c8d8e8;" @click="doLogout">退出</el-button>
       </nav>
     </header>
 
@@ -399,6 +416,59 @@ import * as echarts from 'echarts'
 
 // ── 视图 ──
 const activeView = ref('qa')
+
+// ── 登录 ──
+const loggedIn = ref(!!localStorage.getItem('token'))
+const currentUser = ref(localStorage.getItem('username') || '')
+const loginLoading = ref(false)
+const loginError = ref('')
+const loginForm = reactive({ username: '', password: '' })
+
+async function doLogin() {
+  if (!loginForm.username || !loginForm.password) { loginError.value = '请输入用户名和密码'; return }
+  loginLoading.value = true; loginError.value = ''
+  try {
+    const res = await axios.post('http://127.0.0.1:8000/auth/login', loginForm)
+    const data = res.data
+    localStorage.setItem('token', data.token)
+    localStorage.setItem('username', data.username)
+    axios.defaults.headers.common['Authorization'] = 'Bearer ' + data.token
+    loggedIn.value = true; currentUser.value = data.username
+    loadAllDocuments()
+  } catch (e) {
+    loginError.value = e?.response?.data?.detail || '登录失败'
+  } finally { loginLoading.value = false }
+}
+
+async function doRegister() {
+  if (!loginForm.username || !loginForm.password) { loginError.value = '请输入用户名和密码'; return }
+  if (loginForm.password.length < 4) { loginError.value = '密码至少4位'; return }
+  loginLoading.value = true; loginError.value = ''
+  try {
+    const res = await axios.post('http://127.0.0.1:8000/auth/register', loginForm)
+    const data = res.data
+    localStorage.setItem('token', data.token)
+    localStorage.setItem('username', data.username)
+    axios.defaults.headers.common['Authorization'] = 'Bearer ' + data.token
+    loggedIn.value = true; currentUser.value = data.username
+    loadAllDocuments()
+  } catch (e) {
+    loginError.value = e?.response?.data?.detail || '注册失败'
+  } finally { loginLoading.value = false }
+}
+
+function doLogout() {
+  localStorage.removeItem('token'); localStorage.removeItem('username')
+  delete axios.defaults.headers.common['Authorization']
+  loggedIn.value = false; currentUser.value = ''
+  chatHistory.value = []
+}
+
+// 恢复登录态
+if (loggedIn.value) {
+  axios.defaults.headers.common['Authorization'] = 'Bearer ' + localStorage.getItem('token')
+}
+
 const chatHistory = ref([])
 const chatContainer = ref(null)
 

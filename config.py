@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # ── CORS ──
     CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
 
+    # ── JWT ──
+    JWT_SECRET: str = "change-me-in-production-use-a-long-random-string-here"
+    JWT_EXPIRE_HOURS: int = 24
+
     # ── 应用 ──
     APP_TITLE: str = "智能标准文档管理与RAG问答系统"
     UPLOAD_DIR: str = "uploads"
