@@ -420,7 +420,7 @@ def find_document(db, filename):
     return existing_document
 
 
-def create_document(db, filename, standard_type, industry, tags, filepath: str | None = None):
+def create_document(db, filename, standard_type, industry, tags, filepath: str | None = None, owner_id: int | None = None):
     """创建文档记录。tags 支持 list[str] 或逗号分隔字符串。"""
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(",") if t.strip()]
@@ -431,6 +431,7 @@ def create_document(db, filename, standard_type, industry, tags, filepath: str |
             standard_type=standard_type,
             industry=industry,
             tags=tags,
+            owner_id=owner_id,
         )
         db.add(new_document)
         db.commit()

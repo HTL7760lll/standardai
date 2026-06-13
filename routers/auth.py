@@ -50,6 +50,16 @@ def get_me(user: User = Depends(get_current_user)):
     return {"username": user.username, "role": user.role}
 
 
+def require_role(*roles: str):
+    """依赖注入：检查当前用户角色。用法: Depends(require_role('admin','engineer'))"""
+    def checker(db: Session = Depends(get_db), authorization: str | None = None) -> User:
+        user = get_current_user(db, authorization)
+        if user.role not in roles:
+            raise HTTPException(403, f"权限不足，需要角色: {', '.join(roles)}")
+        return user
+    return checker
+
+
 def get_current_user(db: Session = Depends(get_db), authorization: str | None = None) -> User:
     """从 Authorization header 解析 JWT 并返回用户"""
     if not authorization or not authorization.startswith("Bearer "):

@@ -25,6 +25,7 @@ class Document(Base): #定义数据库模型
     standard_type = Column(String(100),nullable=False,index=True)
     industry = Column(String(100),nullable=False,index=True)
     tags = Column(JSON)
+    owner_id = Column(Integer, nullable=True, index=True)  # 上传者ID
     created_at = Column(DateTime,default=datetime.now)
     updated_at = Column(DateTime,default=datetime.now,onupdate=datetime.now)
 
@@ -81,4 +82,16 @@ class OcrResultCache(Base):
     ocr_text = Column(Text, nullable=False)
     model_name = Column(String(50), nullable=True)
     page_count = Column(Integer, default=1)
+    created_at = Column(DateTime, default=datetime.now)
+
+
+# ── 用户标注笔记 ──
+class Annotation(Base):
+    __tablename__ = "annotations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    document_id = Column(Integer, nullable=False, index=True)
+    chunk_id = Column(Integer, nullable=True, index=True)
+    content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.now)

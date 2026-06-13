@@ -256,7 +256,7 @@
           <el-button type="primary" @click="loadDocuments">搜索</el-button>
         </div>
         <div class="toolbar-right">
-          <el-button type="success" @click="showUploadDialog = true">
+          <el-button v-if="currentRole !== 'viewer'" type="success" @click="showUploadDialog = true">
             <el-icon><Upload /></el-icon> 上传文档
           </el-button>
           <el-button @click="loadDocuments" :loading="loadingDocuments">刷新</el-button>
@@ -292,9 +292,11 @@
         </el-table-column>
         <el-table-column label="操作" width="270" align="center" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" text type="success" :loading="chunkLoadingId === row.id" @click.stop="handleGenerateChunks(row)">切片</el-button>
-            <el-button size="small" text type="warning" @click.stop="handleAnalyze(row)">分析</el-button>
-            <el-button size="small" text type="danger" @click.stop="handleDelete(row)">删除</el-button>
+            <template v-if="currentRole !== 'viewer'">
+              <el-button size="small" text type="success" :loading="chunkLoadingId === row.id" @click.stop="handleGenerateChunks(row)">切片</el-button>
+              <el-button size="small" text type="warning" @click.stop="handleAnalyze(row)">分析</el-button>
+              <el-button v-if="currentRole === 'admin' || row.owner_id === null" size="small" text type="danger" @click.stop="handleDelete(row)">删除</el-button>
+            </template>
           </template>
         </el-table-column>
       </el-table>
@@ -438,6 +440,7 @@ const activeView = ref('qa')
 // ── 登录 ──
 const loggedIn = ref(!!localStorage.getItem('token'))
 const currentUser = ref(localStorage.getItem('username') || '')
+const currentRole = ref(localStorage.getItem('role') || 'viewer')
 const loginLoading = ref(false)
 const loginError = ref('')
 const loginMode = ref('login')
@@ -456,8 +459,9 @@ async function doLogin() {
     const data = res.data
     localStorage.setItem('token', data.token)
     localStorage.setItem('username', data.username)
+    localStorage.setItem('role', data.role)
     axios.defaults.headers.common['Authorization'] = 'Bearer ' + data.token
-    loggedIn.value = true; currentUser.value = data.username
+    loggedIn.value = true; currentUser.value = data.username; currentRole.value = data.role
     loadAllDocuments()
   } catch (e) {
     loginError.value = e?.response?.data?.detail || '登录失败'
@@ -476,8 +480,9 @@ async function doRegister() {
     const data = res.data
     localStorage.setItem('token', data.token)
     localStorage.setItem('username', data.username)
+    localStorage.setItem('role', data.role)
     axios.defaults.headers.common['Authorization'] = 'Bearer ' + data.token
-    loggedIn.value = true; currentUser.value = data.username
+    loggedIn.value = true; currentUser.value = data.username; currentRole.value = data.role
     loadAllDocuments()
   } catch (e) {
     loginError.value = e?.response?.data?.detail || '注册失败'
@@ -485,7 +490,7 @@ async function doRegister() {
 }
 
 function doLogout() {
-  localStorage.removeItem('token'); localStorage.removeItem('username')
+  localStorage.removeItem('token'); localStorage.removeItem('username'); localStorage.removeItem('role')
   delete axios.defaults.headers.common['Authorization']
   loggedIn.value = false; currentUser.value = ''
   chatHistory.value = []
@@ -494,6 +499,7 @@ function doLogout() {
 // 恢复登录态
 if (loggedIn.value) {
   axios.defaults.headers.common['Authorization'] = 'Bearer ' + localStorage.getItem('token')
+  currentRole.value = localStorage.getItem('role') || 'viewer'
 }
 
 const chatHistory = ref([])

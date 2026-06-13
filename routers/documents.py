@@ -1,7 +1,7 @@
 from fastapi import APIRouter,HTTPException, Query, Depends,UploadFile,File,Form, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from routers.auth import get_current_user
+from routers.auth import get_current_user, require_role
 from models import User
 
 limiter = Limiter(key_func=get_remote_address)
@@ -37,7 +37,7 @@ async def create_document(document: DocumentCreate, db: Session = Depends(get_db
 @router.post("/documents/upload", response_model=DocumentMessageOut)
 @limiter.limit("10/minute")
 async def upload_document(request: Request, file: UploadFile = File(...),
-                          user: User = Depends(get_current_user),
+                          user: User = Depends(require_role("admin", "engineer")),
                           standard_type:str =Form(...), #Form是普通字段，因为返回的值是普通字段不是JSON
                           industry:str =Form(...),
                           tags: str = Form(...),
@@ -50,7 +50,7 @@ async def upload_document(request: Request, file: UploadFile = File(...),
     if filepath is None:
         raise HTTPException(status_code=400, detail="只能上传 .pdf、.docx、.txt 类型的文件")
     try :
-        new_document = services.document_service.create_document(db,file.filename,standard_type,industry,tags,filepath)
+        new_document = services.document_service.create_document(db,file.filename,standard_type,industry,tags,filepath,owner_id=user.id)
         if new_document is None:
             raise HTTPException(status_code=500, detail="上传标准文件失败")
 
@@ -755,10 +755,13 @@ async def update_document_by_id(document_id: int, patch_document: DocumentUpdate
 @router.delete("/documents/{document_id}", response_model=MessageOut)  # 根据标准文件的id去删除相对应的文件
 async def delete_document_by_id(document_id: int,
                                 db: Session = Depends(get_db),
-                                user: User = Depends(get_current_user)):
+                                user: User = Depends(require_role("admin", "engineer"))):
     document = services.document_service.get_document_by_id(db,document_id)
     if document is None:
         raise HTTPException(status_code=404, detail="您要删除的标准文件不存在")
+    # engineer 只能删自己的文档
+    if user.role == "engineer" and document.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="您只能删除自己上传的文档")
     # 先删磁盘文件
     file_path = Path(document.filepath) if document.filepath else None
     delete_success = services.document_service.delete_document(db, document)
@@ -785,7 +788,7 @@ async def download_document(document_id: int,db: Session = Depends(get_db)):
 
 @router.post("/documents/{document_id}/chunks")
 async def chunk_documents(document_id: int,db: Session = Depends(get_db),
-                          user: User = Depends(get_current_user)):
+                          user: User = Depends(require_role("admin", "engineer"))):
     document = services.document_service.get_document_by_id(db, document_id)
     if document is None:  # 判断这个文件id在不在数据库
         raise HTTPException(status_code=404, detail="您要的标准文件不存在")
@@ -831,7 +834,8 @@ async def chunk_documents(document_id: int,db: Session = Depends(get_db),
 @router.post("/documents/{document_id}/analyze")
 def analyze_document(
         document_id: int,
-        db: Session = Depends(get_db)
+        db: Session = Depends(get_db),
+        user: User = Depends(require_role("admin", "engineer"))
 ):
     document = services.document_service.get_document_by_id(db, document_id)
 
