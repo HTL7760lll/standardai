@@ -686,7 +686,6 @@ function clearChat() {
   chatHistory.value = []
   ElMessage.success('对话已清空')
 }
-}
 
 function selectRecommendedDoc(rec) {
   if (!askDocIds.value.includes(rec.document_id)) {
