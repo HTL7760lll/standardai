@@ -100,4 +100,30 @@ export function deleteDocument(documentId) {
   return api.delete(`/documents/${documentId}`)
 }
 
+// 标注
+export function createAnnotation(data) {
+  return api.post('/annotations', data)
+}
+
+// 起草辅助
+export function getClauses(documentId) {
+  return api.get(`/documents/${documentId}/clauses`)
+}
+export function draftCheck(documentId, data) {
+  return api.post(`/documents/${documentId}/draft-check`, data)
+}
+
+// 引用图谱
+export function getCitationGraph() {
+  return api.get('/documents/citations/graph')
+}
+
+// 认证
+export function login(data) {
+  return api.post('/auth/login', data)
+}
+export function register(data) {
+  return api.post('/auth/register', data)
+}
+
 export default api

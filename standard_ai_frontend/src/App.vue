@@ -462,8 +462,7 @@
 import { onMounted, reactive, ref, nextTick, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { UploadFilled, Upload, Search, User, Lock } from '@element-plus/icons-vue'
-import { askQuestion, askStream, generateChunks, getDocuments, uploadDocument, analyzeDocument, getDocumentStats, searchDocuments, deleteDocument } from './services/api'
-import axios from 'axios'
+import { askQuestion, askStream, generateChunks, getDocuments, uploadDocument, analyzeDocument, getDocumentStats, searchDocuments, deleteDocument, createAnnotation, getClauses, draftCheck, getCitationGraph, login, register } from './services/api'
 import { marked } from 'marked'
 import * as echarts from 'echarts'
 
@@ -488,7 +487,7 @@ async function doLogin() {
   if (!loginForm.username || !loginForm.password) { loginError.value = '请输入用户名和密码'; return }
   loginLoading.value = true; loginError.value = ''
   try {
-    const res = await axios.post('http://127.0.0.1:8000/auth/login', { username: loginForm.username, password: loginForm.password })
+    const res = await login({ username: loginForm.username, password: loginForm.password })
     const data = res.data
     localStorage.setItem('token', data.token)
     localStorage.setItem('username', data.username)
@@ -509,7 +508,7 @@ async function doRegister() {
   if (loginForm.password !== loginForm.confirm) { loginError.value = '两次密码不一致'; return }
   loginLoading.value = true; loginError.value = ''
   try {
-    const res = await axios.post('http://127.0.0.1:8000/auth/register', { username: loginForm.username, password: loginForm.password })
+    const res = await register({ username: loginForm.username, password: loginForm.password })
     const data = res.data
     localStorage.setItem('token', data.token)
     localStorage.setItem('username', data.username)
@@ -596,7 +595,7 @@ async function openDraftCheck(row) {
   showDraftDialog.value = true; draftLoading.value = true; draftResult.value = ''; draftClauses.value = []
   draftDocId.value = row.id
   try {
-    const res = await axios.get(`http://127.0.0.1:8000/documents/${row.id}/clauses`)
+    const res = await getClauses(row.id)
     draftClauses.value = res.data.clauses || []
   } catch { ElMessage.error('加载条款失败，请先生成切片') }
   finally { draftLoading.value = false }
@@ -605,7 +604,7 @@ async function openDraftCheck(row) {
 async function checkDraftClause(cl) {
   draftResult.value = '检查中...'
   try {
-    const res = await axios.post(`http://127.0.0.1:8000/documents/${draftDocId.value}/draft-check`, {
+    const res = await draftCheck(draftDocId.value, {
       question: `草案第 ${cl.section_number} 条（${cl.section_path}）与现行标准中的相关要求是否冲突？如有，请列出差异和修改建议`,
       limit: 5,
     })
@@ -617,7 +616,7 @@ async function saveAnnotation() {
   if (!annotationText.value.trim()) { ElMessage.warning('请输入标注内容'); return }
   annotationSaving.value = true
   try {
-    await axios.post('http://127.0.0.1:8000/annotations', {
+    await createAnnotation({
       document_id: annotationRef.value.document_id,
       chunk_id: annotationRef.value.chunk_id || null,
       content: annotationText.value.trim(),
@@ -912,7 +911,7 @@ async function showCitationGraph() {
   showCitationDialog.value = true
   citationLoading.value = true
   try {
-    const res = await axios.get('http://127.0.0.1:8000/documents/citations/graph')
+    const res = await getCitationGraph()
     citationData.value = res.data.graph || { nodes: [], edges: [] }
   } catch {
     ElMessage.error('加载引用关系失败')
