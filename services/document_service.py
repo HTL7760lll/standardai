@@ -1998,6 +1998,14 @@ def save_document_chunk(db, chunks, document_id: int):
                     ))
 
         db.commit()
+
+        # 重建 faiss 索引（新 chunk 入库后自动同步）
+        try:
+            import services.vector_index as vi
+            vi.rebuild_from_db(db)
+        except Exception as e:
+            logger.warning(f"faiss 索引重建跳过: {e}")
+
     except SQLAlchemyError as e:
         logger.error(f"保存chunks 或 embedding 失败：{e!r}")
         traceback.print_exc()
