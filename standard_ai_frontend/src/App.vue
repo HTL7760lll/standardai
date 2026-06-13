@@ -49,7 +49,10 @@
         <a href="https://std.samr.gov.cn/" target="_blank" class="nav-link" title="国家标准全文公开系统">
           🔗 国标公开平台
         </a>
-        <span style="color:#c8d8e8;font-size:13px;margin-left:12px;">👤 {{ currentUser }}</span>
+        <span style="color:#c8d8e8;font-size:13px;margin-left:12px;">
+          👤 {{ currentUser }}
+          <el-tag size="small" :type="currentRole==='admin'?'danger':currentRole==='engineer'?'warning':'info'" style="margin-left:4px;vertical-align:middle;">{{ currentRole==='admin'?'管理员':currentRole==='engineer'?'工程师':'访客' }}</el-tag>
+        </span>
         <el-button text size="small" style="color:#c8d8e8;" @click="doLogout">退出</el-button>
       </nav>
     </header>
@@ -119,6 +122,7 @@
                     </div>
                     <div class="ref-section-path" v-if="ref.section_path">📂 {{ ref.section_path }}</div>
                     <div class="ref-outside-text">{{ ref.content_preview?.substring(0, 250) }}</div>
+                    <el-button size="small" text type="primary" style="margin-top:4px;" @click.stop="startAnnotation(ref)">✏️ 标注</el-button>
                   </div>
                 </div>
               </template>
@@ -140,6 +144,7 @@
                       </div>
                       <div class="ref-section-path" v-if="ref.section_path">📂 {{ ref.section_path }}</div>
                       <div class="ref-outside-text">{{ ref.content_preview?.substring(0, 250) }}</div>
+                      <el-button size="small" text type="primary" style="margin-top:4px;" @click.stop="startAnnotation(ref)">✏️ 标注</el-button>
                     </div>
                   </el-collapse-item>
                 </el-collapse>
@@ -295,7 +300,7 @@
             <template v-if="currentRole !== 'viewer'">
               <el-button size="small" text type="success" :loading="chunkLoadingId === row.id" @click.stop="handleGenerateChunks(row)">切片</el-button>
               <el-button size="small" text type="warning" @click.stop="handleAnalyze(row)">分析</el-button>
-              <el-button v-if="currentRole === 'admin' || row.owner_id === null" size="small" text type="danger" @click.stop="handleDelete(row)">删除</el-button>
+              <el-button v-if="currentRole === 'admin' || (currentRole === 'engineer')" size="small" text type="danger" @click.stop="handleDelete(row)">删除</el-button>
             </template>
           </template>
         </el-table-column>
@@ -393,6 +398,18 @@
       </template>
     </el-dialog>
   </div>
+
+  <!-- ═══════════ 标注弹窗 ═══════════ -->
+  <el-dialog v-model="showAnnotationDialog" title="添加标注笔记" width="460px">
+    <p style="color:#909399;font-size:13px;margin-bottom:8px;">
+      📂 {{ annotationRef?.section_path || '未知章节' }}
+    </p>
+    <el-input v-model="annotationText" type="textarea" :rows="4" placeholder="输入你的标注笔记..." />
+    <template #footer>
+      <el-button @click="showAnnotationDialog = false">取消</el-button>
+      <el-button type="primary" :loading="annotationSaving" @click="saveAnnotation">保存标注</el-button>
+    </template>
+  </el-dialog>
 
   <!-- ═══════════ 引用关系图谱弹窗 ═══════════ -->
   <el-dialog v-model="showCitationDialog" title="标准引用关系图谱" width="700px">
@@ -539,6 +556,34 @@ const showAnalysisDialog = ref(false)
 const showCitationDialog = ref(false)
 const citationLoading = ref(false)
 const citationData = ref({ nodes: [], edges: [] })
+
+// ── 标注 ──
+const showAnnotationDialog = ref(false)
+const annotationText = ref('')
+const annotationRef = ref(null)
+const annotationSaving = ref(false)
+
+function startAnnotation(ref) {
+  annotationRef.value = ref
+  annotationText.value = ''
+  showAnnotationDialog.value = true
+}
+
+async function saveAnnotation() {
+  if (!annotationText.value.trim()) { ElMessage.warning('请输入标注内容'); return }
+  annotationSaving.value = true
+  try {
+    await axios.post('http://127.0.0.1:8000/annotations', {
+      document_id: annotationRef.value.document_id,
+      chunk_id: annotationRef.value.chunk_id || null,
+      content: annotationText.value.trim(),
+    })
+    ElMessage.success('标注已保存')
+    showAnnotationDialog.value = false
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '保存失败')
+  } finally { annotationSaving.value = false }
+}
 const analysisResult = ref(null)
 const analysisDocName = ref('')
 const analysisDocNumber = ref('')

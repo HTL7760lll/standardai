@@ -10,6 +10,7 @@ from config import settings
 from logging_config import setup_logging, get_logger
 from routers.documents import router as documents_router
 from routers.auth import router as auth_router
+from routers.annotations import router as annotations_router
 
 setup_logging()
 logger = get_logger(__name__)
@@ -65,4 +66,5 @@ def build_vector_index():
         logger.warning(f"faiss 索引构建跳过: {e}")
 
 app.include_router(auth_router)
+app.include_router(annotations_router)
 app.include_router(documents_router)
