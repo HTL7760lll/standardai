@@ -2987,3 +2987,106 @@ def assemble_verified_answer(selection: dict, sentences: list[dict]) -> dict:
         "evidence_count": len(sentences),
         "selected_count": len(parts),
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+# 标准引用关系图谱
+# ═══════════════════════════════════════════════════════════════
+
+def extract_citation_relations(db) -> list[dict]:
+    """
+    从所有"规范性引用文件"chunks 中提取引用关系。
+    返回: [{"source_id": int, "source_name": str, "target_number": str}, ...]
+    """
+    from models import Document
+    relations = []
+    docs = {d.id: d for d in db.query(Document).all()}
+    chunks = db.query(DocumentChunk).filter(
+        DocumentChunk.chunk_type == "references"
+    ).all()
+
+    seen = set()
+    for chunk in chunks:
+        content = chunk.content or ""
+        doc = docs.get(chunk.document_id)
+        if not doc:
+            continue
+        for match in _STD_NUM_RE.finditer(content):
+            target = match.group(0).strip()
+            # 过滤明显不是标准编号的（如版本号、页码）
+            if len(target) < 5 or target.startswith("20"):
+                continue
+            key = (chunk.document_id, target)
+            if key not in seen:
+                seen.add(key)
+                relations.append({
+                    "source_id": chunk.document_id,
+                    "source_name": doc.filename or "",
+                    "target_number": target,
+                })
+
+    return relations
+
+
+def build_citation_graph(db) -> dict:
+    """构建标准引用关系图，返回 nodes + edges"""
+    relations = extract_citation_relations(db)
+    if not relations:
+        return {"nodes": [], "edges": []}
+
+    # 构建节点：每个文档有 standard_number 的用编号，否则用文件名简写
+    from models import Document
+    docs = {d.id: d for d in db.query(Document).all()}
+
+    nodes = []
+    node_ids = set()
+    for doc_id, doc in docs.items():
+        node_ids.add(str(doc_id))
+        # 从文件名提取标准编号
+        num_match = _STD_NUM_RE.search(doc.filename or "")
+        label = num_match.group(0) if num_match else (doc.filename or f"文档{doc_id}")[:30]
+        nodes.append({
+            "id": str(doc_id),
+            "label": label,
+            "filename": doc.filename or "",
+            "is_source": True,
+        })
+
+    # 构建边
+    edges = []
+    edge_set = set()
+    for rel in relations:
+        target_num = rel["target_number"]
+        # 尝试在已有文档中匹配这个标准编号
+        for doc_id, doc in docs.items():
+            if doc_id == rel["source_id"]:
+                continue
+            if target_num in (doc.filename or "") or target_num in (doc.standard_type or ""):
+                edge_key = (str(rel["source_id"]), str(doc_id))
+                if edge_key not in edge_set:
+                    edge_set.add(edge_key)
+                    edges.append({
+                        "source": str(rel["source_id"]),
+                        "target": str(doc_id),
+                        "label": target_num,
+                    })
+                    node_ids.add(str(doc_id))
+                break
+        else:
+            # 未匹配到库内文档 → 作为外部节点
+            ext_id = f"ext:{target_num}"
+            if ext_id not in node_ids:
+                node_ids.add(ext_id)
+                nodes.append({
+                    "id": ext_id,
+                    "label": target_num,
+                    "filename": target_num,
+                    "is_source": False,
+                })
+            edges.append({
+                "source": str(rel["source_id"]),
+                "target": ext_id,
+                "label": target_num,
+            })
+
+    return {"nodes": list(nodes), "edges": list(edges)}

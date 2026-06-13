@@ -225,6 +225,7 @@
             <el-icon><Upload /></el-icon> 上传文档
           </el-button>
           <el-button @click="loadDocuments" :loading="loadingDocuments">刷新</el-button>
+          <el-button type="info" text @click="showCitationGraph">🔗 引用关系</el-button>
         </div>
       </div>
 
@@ -355,6 +356,36 @@
       </template>
     </el-dialog>
   </div>
+
+  <!-- ═══════════ 引用关系图谱弹窗 ═══════════ -->
+  <el-dialog v-model="showCitationDialog" title="标准引用关系图谱" width="700px">
+    <div v-if="citationLoading" style="text-align:center;padding:30px;">加载中...</div>
+    <div v-else-if="citationData.nodes.length === 0" style="text-align:center;padding:30px;color:#999;">暂无引用数据</div>
+    <div v-else>
+      <div style="margin-bottom:8px;color:#909399;font-size:13px;">
+        📊 {{ citationData.nodes.filter(n=>n.is_source).length }} 份库内标准，
+        🔗 {{ citationData.edges.length }} 条引用关系，
+        📖 {{ citationData.nodes.filter(n=>!n.is_source).length }} 份外部引用标准
+      </div>
+      <el-table :data="citationData.edges" size="small" max-height="400" stripe>
+        <el-table-column label="引用方" min-width="180">
+          <template #default="{ row }">
+            {{ citationData.nodes.find(n=>n.id===row.source)?.label || row.source }}
+          </template>
+        </el-table-column>
+        <el-table-column label="关系" width="60" align="center">
+          <template #default><span style="color:#409eff;">→ 引用</span></template>
+        </el-table-column>
+        <el-table-column label="被引用标准" min-width="150">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.target.startsWith('ext:') ? 'warning' : 'success'">
+              {{ row.label }}
+            </el-tag>
+          </template>
+        </el-table-column>
+      </el-table>
+    </div>
+  </el-dialog>
 </template>
 
 <script setup>
@@ -402,6 +433,9 @@ const chunkLoadingId = ref(null)
 const showDetailDialog = ref(false)
 const detailDoc = ref(null)
 const showAnalysisDialog = ref(false)
+const showCitationDialog = ref(false)
+const citationLoading = ref(false)
+const citationData = ref({ nodes: [], edges: [] })
 const analysisResult = ref(null)
 const analysisDocName = ref('')
 const analysisDocNumber = ref('')
@@ -679,6 +713,19 @@ function retryAsk(msg) {
       question.value = userMsg.content
       setTimeout(() => submitAsk(), 100)
     }
+  }
+}
+
+async function showCitationGraph() {
+  showCitationDialog.value = true
+  citationLoading.value = true
+  try {
+    const res = await axios.get('http://127.0.0.1:8000/documents/citations/graph')
+    citationData.value = res.data.graph || { nodes: [], edges: [] }
+  } catch {
+    ElMessage.error('加载引用关系失败')
+  } finally {
+    citationLoading.value = false
   }
 }
 

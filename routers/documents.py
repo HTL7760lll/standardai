@@ -689,6 +689,13 @@ async def get_documents(filename: str | None = Query(None),standard_type: str | 
     return result
 
 
+@router.get("/documents/citations/graph")
+def get_citation_graph(db: Session = Depends(get_db)):
+    """标准引用关系图谱"""
+    graph = services.document_service.build_citation_graph(db)
+    return {"message": "引用关系图谱", "graph": graph}
+
+
 @router.get("/documents/stats", response_model=DocumentStatsResponse)  # 标准文件统计接口
 async def get_document_stats(db: Session = Depends(get_db)):
     total,standard_types,industries,tag_stats = services.document_service.get_document_stats(db)
