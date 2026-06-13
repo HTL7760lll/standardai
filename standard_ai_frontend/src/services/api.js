@@ -7,6 +7,15 @@ const api = axios.create({
   timeout: 120000,
 })
 
+// 自动注入 Token
+api.interceptors.request.use(config => {
+  const token = localStorage.getItem('token')
+  if (token) {
+    config.headers.Authorization = 'Bearer ' + token
+  }
+  return config
+})
+
 // ── 文档管理 ──
 export function getDocuments(params = {}) {
   return api.get('/documents', { params })
