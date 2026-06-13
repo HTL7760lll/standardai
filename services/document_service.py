@@ -2286,6 +2286,36 @@ def _compute_idf_weights(db, force_refresh: bool = False) -> dict[str, float]:
     return idf
 
 
+def _format_comparison_context(references: list[dict]) -> str:
+    """将参考资料按标准分组，构建对比 prompt 上下文"""
+    groups = {}
+    for r in references:
+        did = r.get("document_id", 0)
+        if did not in groups:
+            groups[did] = {
+                "filename": r.get("filename", "未知标准"),
+                "items": [],
+            }
+        groups[did]["items"].append(r)
+
+    parts = []
+    for did, g in groups.items():
+        parts.append(f"\n【{g['filename']}】")
+        for i, item in enumerate(g["items"], 1):
+            section = item.get("section_path", "") or ""
+            chunk_type = item.get("chunk_type_cn", "") or item.get("chunk_type", "") or ""
+            content = item.get("content", "") or ""
+            # 截断过长内容
+            if len(content) > 600:
+                content = content[:600] + "..."
+            parts.append(
+                f"  条款{i} [{chunk_type}] {section}\n"
+                f"  {content}\n"
+            )
+
+    return "\n".join(parts)
+
+
 def _expand_query_synonyms(question: str) -> str:
     """
     零结果查询扩展：对长查询尝试删除修饰词生成更短的查询。

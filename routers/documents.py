@@ -275,6 +275,44 @@ def ask(request:AskQuestion,db: Session = Depends(get_db)):
             "prompt_preview": None,
         }
 
+    # ═══ 对比模式：专用结构化 prompt ═══
+    if is_comparison:
+        # 按标准分组构建对比上下文
+        comparison_context = services.document_service._format_comparison_context(references)
+        comparison_answer = services.llm_service.generate_comparison_answer(
+            request.question, comparison_context, references
+        )
+        return {
+            "question": request.question,
+            "question_intent": question_intent,
+            "search_mode": "comparison",
+            "search_terms": search_terms,
+            "answer": comparison_answer,
+            "references": [{
+                "document_id": r["document_id"],
+                "filename": r["filename"],
+                "chunk_index": r["chunk_index"],
+                "chunk_type": r["chunk_type"],
+                "chunk_type_cn": r["chunk_type_cn"],
+                "section_path": r["section_path"],
+                "page_number": r["page_number"],
+                "score": r["score"],
+                "content_preview": r["content"][:300],
+                "content_length": r["content_length"],
+                "match_type": r["match_type"],
+                "source_label": r["source_label"],
+            } for r in references],
+            "retrieval_confidence": confidence,
+            "confidence_detail": confidence_detail,
+            "is_comparison": True,
+            "comparison_count": len(doc_ids),
+            "auto_matched_document": {
+                "document_id": auto_matched_doc.id,
+                "filename": auto_matched_doc.filename,
+            } if auto_matched_doc else None,
+            "auto_match_fallback": auto_match_fallback,
+        }
+
     # ═══ Grounded Evidence Extraction 三层防御 ═══
 
     # 层1：从 references 抽取与问题最相关的证据句子
@@ -440,6 +478,53 @@ async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
             yield "data: {}\n\n".format(json.dumps({"type": "done"}))
 
         return StreamingResponse(empty_stream(), media_type="text/event-stream")
+
+    # ── 对比模式（流式版）──
+    is_comparison = request.document_ids is not None and len(request.document_ids) >= 2
+    if is_comparison:
+        async def comparison_stream():
+            # 先发 meta
+            yield "data: {}\n\n".format(json.dumps({
+                "type": "meta",
+                "references": [{
+                    "document_id": r["document_id"],
+                    "filename": r["filename"],
+                    "chunk_index": r["chunk_index"],
+                    "chunk_type": r["chunk_type"],
+                    "chunk_type_cn": r["chunk_type_cn"],
+                    "section_path": r["section_path"],
+                    "page_number": r["page_number"],
+                    "score": r["score"],
+                    "content_preview": r["content"][:300],
+                    "content_length": r["content_length"],
+                    "match_type": r["match_type"],
+                    "source_label": r["source_label"],
+                } for r in references],
+                "recommendations": None,
+                "follow_up_questions": [],
+                "is_comparison": True,
+                "comparison_count": len(request.document_ids),
+                "auto_matched_document": {
+                    "document_id": auto_matched_doc.id,
+                    "filename": auto_matched_doc.filename,
+                } if auto_matched_doc else None,
+                "auto_match_fallback": auto_match_fallback,
+            }, ensure_ascii=False))
+            # 生成对比回答并逐token输出
+            comparison_context = services.document_service._format_comparison_context(references)
+            stream = services.llm_service.generate_comparison_answer_stream(
+                request.question, comparison_context, references
+            )
+            try:
+                for chunk in stream:
+                    content = chunk.choices[0].delta.content or ""
+                    if content:
+                        yield "data: {}\n\n".format(json.dumps({"type": "token", "content": content}, ensure_ascii=False))
+            except Exception as e:
+                yield "data: {}\n\n".format(json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False))
+            yield "data: {}\n\n".format(json.dumps({"type": "done"}))
+
+        return StreamingResponse(comparison_stream(), media_type="text/event-stream")
 
     # ═══ Grounded Evidence Extraction 三层防御（流式版）═══
 

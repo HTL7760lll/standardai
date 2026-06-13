@@ -157,3 +157,109 @@ def select_evidence_sentences(question: str, sentences: list[dict]) -> dict:
     result.setdefault("summary", "")
 
     return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# 对比模式 — 结构化对比回答
+# ═══════════════════════════════════════════════════════════════
+
+_COMPARISON_SYSTEM_PROMPT = (
+    "你是标准文档对比分析专家。你精通中国标准体系（国标/行标/地标/企标），"
+    "擅长跨标准条款对比、差异分析和合规判断。"
+)
+
+
+def generate_comparison_answer(question: str, context: str, references: list[dict]) -> str:
+    """对比模式：生成结构化对比回答"""
+    # 构建标准列表
+    std_names = []
+    seen = set()
+    for r in references:
+        fn = r.get("filename", "")
+        if fn and fn not in seen:
+            seen.add(fn)
+            std_names.append(fn)
+
+    std_list = "\n".join([f"- {n}" for n in std_names])
+
+    prompt = (
+        f"用户要求对比以下 {len(std_names)} 份标准中的相关内容：\n{std_list}\n\n"
+        f"用户问题：{question}\n\n"
+        f"【参考资料（已按标准分组）】\n{context}\n\n"
+        f"【你的任务——必须严格遵守输出格式】\n\n"
+        f"## 逐标准条款\n"
+        f"依次列出每份标准中与问题相关的条款。每条必须包含：\n"
+        f"- 标准名称\n"
+        f"- 章节路径（从参考资料中提取）\n"
+        f"- 条款要点（用原文关键句，禁止编造）\n\n"
+        f"## 对比分析\n"
+        f"用表格对比核心维度：\n"
+        f"| 对比维度 | {std_names[0] if std_names else '标准A'} | {std_names[1] if len(std_names)>1 else '标准B'} |\n"
+        f"|------|---------|----------|\n"
+        f"（列出 2-5 个核心对比维度，从参考资料中提取具体内容）\n\n"
+        f"### ✅ 相同点\n"
+        f"1. ...\n\n"
+        f"### ⚠️ 差异点\n"
+        f"1. ...\n"
+        f"（如果某标准未涉及该问题，明确标注'该标准未涉及此方面'）\n\n"
+        f"### 🔗 互补关系\n"
+        f"- 说明这几份标准之间的关系（引用/补充/细化/替代），对标准起草的启示\n\n"
+        f"【重要约束】\n"
+        f"1. 绝对禁止编造参考资料中没有的条款编号、数值、指标\n"
+        f"2. 如果某标准在参考资料中没有相关内容，明确说'未找到相关内容'\n"
+        f"3. 章节路径必须从参考资料原文中提取，不要自己编"
+    )
+
+    try:
+        messages = [
+            {"role": "system", "content": _COMPARISON_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        response = client.chat.completions.create(
+            model=settings.DEEPSEEK_MODEL,
+            messages=messages,
+            temperature=0.3,
+        )
+        if response.choices:
+            return response.choices[0].message.content or "模型返回为空"
+        return "模型未返回有效结果"
+    except Exception as e:
+        return f"对比分析失败: {e}"
+
+
+def generate_comparison_answer_stream(question: str, context: str, references: list[dict]):
+    """对比模式：流式生成结构化对比回答"""
+    std_names = []
+    seen = set()
+    for r in references:
+        fn = r.get("filename", "")
+        if fn and fn not in seen:
+            seen.add(fn)
+            std_names.append(fn)
+
+    std_list = "\n".join([f"- {n}" for n in std_names])
+
+    prompt = (
+        f"用户要求对比以下 {len(std_names)} 份标准中的相关内容：\n{std_list}\n\n"
+        f"用户问题：{question}\n\n"
+        f"【参考资料（已按标准分组）】\n{context}\n\n"
+        f"【输出格式——必须严格遵守】\n\n"
+        f"## 逐标准条款\n"
+        f"依次列出每份标准的相关条款（含章节路径+条款要点）\n\n"
+        f"## 对比分析\n"
+        f"| 对比维度 | {std_names[0] if std_names else '标准A'} | {std_names[1] if len(std_names)>1 else '标准B'} |\n"
+        f"|------|---------|----------|\n\n"
+        f"### ✅ 相同点\n### ⚠️ 差异点\n### 🔗 互补关系\n\n"
+        f"禁止编造参考资料中没有的条款编号和数值。"
+    )
+
+    messages = [
+        {"role": "system", "content": _COMPARISON_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    return client.chat.completions.create(
+        model=settings.DEEPSEEK_MODEL,
+        messages=messages,
+        temperature=0.3,
+        stream=True,
+    )
