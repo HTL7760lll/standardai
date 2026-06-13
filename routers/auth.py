@@ -47,8 +47,7 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
 
 def require_role(*roles: str):
     """依赖注入：检查当前用户角色。用法: Depends(require_role('admin','engineer'))"""
-    def checker(db: Session = Depends(get_db), authorization: str | None = Header(None)) -> User:
-        user = get_current_user(db, authorization)
+    def checker(user: User = Depends(get_current_user)) -> User:
         if user.role not in roles:
             raise HTTPException(403, f"权限不足，需要角色: {', '.join(roles)}")
         return user
