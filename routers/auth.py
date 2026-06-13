@@ -45,11 +45,6 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
     return {"message": "登录成功", "token": token, "username": user.username, "role": user.role}
 
 
-@router.get("/me")
-def get_me(user: User = Depends(get_current_user)):
-    return {"username": user.username, "role": user.role}
-
-
 def require_role(*roles: str):
     """依赖注入：检查当前用户角色。用法: Depends(require_role('admin','engineer'))"""
     def checker(db: Session = Depends(get_db), authorization: str | None = None) -> User:
@@ -73,3 +68,8 @@ def get_current_user(db: Session = Depends(get_db), authorization: str | None = 
     if not user:
         raise HTTPException(401, "用户不存在或已禁用")
     return user
+
+
+@router.get("/me")
+def get_me(user: User = Depends(get_current_user)):
+    return {"username": user.username, "role": user.role}
