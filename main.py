@@ -44,4 +44,17 @@ def health_check():
     llm_status = "available" if settings.DEEPSEEK_API_KEY else "unavailable"
     return {"status": "ok", "database": db_status, "llm": llm_status}
 
+
+@app.on_event("startup")
+def build_vector_index():
+    """启动时构建 faiss 向量索引"""
+    try:
+        from database import SessionLocal
+        import services.vector_index as vi
+        db = SessionLocal()
+        vi.rebuild_from_db(db)
+        db.close()
+    except Exception as e:
+        logger.warning(f"faiss 索引构建跳过: {e}")
+
 app.include_router(documents_router)

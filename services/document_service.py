@@ -2023,13 +2023,33 @@ def delete_chunks_by_id(db, document_id: int):
 # ═══════════════════════════════════════════════════════════════
 
 def semantic_search_chunks(db, question: str, limit: int = 5, document_ids: list[int] | None = None):
-    """语义检索：支持多标准。模型不可用时降级返回空，不阻塞关键词检索。"""
+    """语义检索：faiss ANN 加速。模型不可用时降级返回空。"""
     try:
         question_embedding = services.embedding_service.generate_query_embedding(question)
     except Exception as e:
         logger.warning(f"语义检索跳过（embedding 模型不可用）: {e}")
         return []
 
+    # 优先使用 faiss 索引（毫秒级 ANN 检索）
+    import services.vector_index as vi
+    if vi.is_built():
+        results = vi.search(question_embedding, k=limit * 3)
+        if results:
+            scored_chunks = []
+            chunk_ids = [cid for cid, _ in results]
+            # 批量查询 chunks（过滤 document_ids）
+            query = db.query(DocumentChunk).filter(DocumentChunk.id.in_(chunk_ids))
+            if document_ids:
+                query = query.filter(DocumentChunk.document_id.in_(document_ids))
+            chunk_map = {c.id: c for c in query.all()}
+            for cid, score in results:
+                chunk = chunk_map.get(cid)
+                if chunk and score >= 0.55:
+                    scored_chunks.append({"chunk": chunk, "score": score})
+            scored_chunks.sort(key=lambda x: x["score"], reverse=True)
+            return scored_chunks[:limit]
+
+    # 降级：数据库查询 + Python 余弦相似度（兜底）
     query = db.query(DocumentChunk).filter(
         DocumentChunk.embedding.isnot(None)
     )
