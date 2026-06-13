@@ -492,7 +492,6 @@ async function doLogin() {
     localStorage.setItem('token', data.token)
     localStorage.setItem('username', data.username)
     localStorage.setItem('role', data.role)
-    axios.defaults.headers.common['Authorization'] = 'Bearer ' + data.token
     loggedIn.value = true; currentUser.value = data.username; currentRole.value = data.role
     loadAllDocuments()
   } catch (e) {
@@ -513,7 +512,6 @@ async function doRegister() {
     localStorage.setItem('token', data.token)
     localStorage.setItem('username', data.username)
     localStorage.setItem('role', data.role)
-    axios.defaults.headers.common['Authorization'] = 'Bearer ' + data.token
     loggedIn.value = true; currentUser.value = data.username; currentRole.value = data.role
     loadAllDocuments()
   } catch (e) {
@@ -523,14 +521,12 @@ async function doRegister() {
 
 function doLogout() {
   localStorage.removeItem('token'); localStorage.removeItem('username'); localStorage.removeItem('role')
-  delete axios.defaults.headers.common['Authorization']
   loggedIn.value = false; currentUser.value = ''
   chatHistory.value = []
 }
 
-// 恢复登录态
+// 恢复登录态（api 拦截器自动从 localStorage 读 token）
 if (loggedIn.value) {
-  axios.defaults.headers.common['Authorization'] = 'Bearer ' + localStorage.getItem('token')
   currentRole.value = localStorage.getItem('role') || 'viewer'
 }
 
