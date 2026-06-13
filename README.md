@@ -1,63 +1,70 @@
 # 智能标准文档管理与 RAG 问答系统
 
-> 基于 FastAPI + Vue 3 + DeepSeek 的企业标准文档智能问答平台。支持 PDF/DOCX/TXT 上传、结构感知切片、混合检索（关键词+语义）、SSE 流式问答、标准动态监控。
+> 面向标准工程师和研究人员的 AI 助手。上传标准文档（PDF/DOCX/TXT），智能解析切片，自然语言问答，多标准对比分析。
 
-## 功能特性
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-- 📄 **文档管理** — 上传/下载/搜索/筛选 PDF、DOCX、TXT 标准文件
-- 🧩 **智能切片** — v2 结构感知切片，按封面/前言/范围/术语/条款/表格/附录区域精准切分
-- 🔍 **混合检索** — jieba 关键词 + sentence-transformers 语义检索 + 联动父子 chunk 扩展
-- 💬 **流式问答** — SSE 逐 token 推送，DeepSeek 生成，强制条款引用+原文摘录
-- 📖 **相关推荐** — 同行业/语义相似/引用关系三维度推荐相关标准
-- 🔎 **标准监控** — 标准版本追踪、状态变更日志、自动/手动检查
+## 功能演示
+
+```
+上传标准 → 自动解析切片 → 问答/对比/起草辅助
+
+📄 文档管理    — 上传/搜索/筛选/删除，支持扫描件 OCR
+🔍 智能问答    — 自然语言提问，条款级精确引用（含章节路径+页码）
+📊 多标准对比  — 同时查 2-5 份标准，自动生成对比表格+异同分析
+📝 起草辅助    — 上传草案，逐条检查是否与现行标准冲突
+🔗 引用图谱    — 可视化标准间的引用关系网络
+👤 三级权限    — 管理员/工程师/访客，角色分离
+✏️ 标注笔记    — 条款级私有笔记
+```
 
 ## 技术栈
 
 | 层 | 技术 |
 |----|------|
-| 后端 | FastAPI + SQLAlchemy + MySQL |
+| 后端框架 | FastAPI + SQLAlchemy + MySQL |
 | 前端 | Vue 3 + Element Plus + ECharts |
-| AI | DeepSeek + sentence-transformers (MiniLM) |
-| OCR | PaddleOCR + PyMuPDF |
+| LLM | DeepSeek Chat API |
+| 向量模型 | sentence-transformers (MiniLM-L12, 384维) |
+| OCR | PaddleOCR 2.7 + PyMuPDF |
 | 分词 | jieba |
+| 向量加速 | faiss IndexFlatIP |
+| 全文索引 | MySQL FULLTEXT ngram |
+| 认证 | JWT + bcrypt |
+| 日志 | structlog + RotatingFileHandler |
 
-## 快速开始
+## 快速启动
 
-### 1. 环境要求
+### 环境要求
 
 - Python 3.10+
 - MySQL 8.0+
 - Node.js 18+
 
-### 2. 后端部署
+### 1. 后端
 
 ```bash
-# 克隆仓库
-git clone https://github.com/yourname/standard-ai.git
-cd standard-ai
+git clone https://github.com/HTL7760lll/standardai.git
+cd standard_ai
 
-# 创建虚拟环境
+# 虚拟环境
 python -m venv .venv
-.venv\Scripts\activate  # Windows
-# source .venv/bin/activate  # Mac/Linux
+.venv\Scripts\activate
 
-# 安装依赖
+# 依赖
 pip install -r requirements.txt
 
-# 配置环境变量
+# 配置 .env（填入 DeepSeek API Key）
 cp .env_example .env
-# 编辑 .env，填入你的 DeepSeek API Key
 
-# 初始化数据库（在 MySQL 中创建 standard_ai 库后）
-python init_db.py
-python migrate_chunks_v2.py
-python migrate_v3_watchdog_ocr.py
+# 创建数据库
+mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS standard_ai DEFAULT CHARSET utf8mb4"
 
-# 启动后端
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+# 启动（首次运行自动建表+构建faiss索引）
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-### 3. 前端部署
+### 2. 前端
 
 ```bash
 cd standard_ai_frontend
@@ -67,48 +74,60 @@ npm run dev
 
 访问 `http://localhost:5173`
 
-### 4. 数据库配置
+### 3. Docker（一键部署）
 
-默认连接: `mysql+pymysql://root:123456@127.0.0.1:3306/standard_ai`
+```bash
+docker-compose up -d
+```
 
-可在 `database.py` 中修改。
-
-## API 接口概览
-
-| 接口 | 说明 |
-|------|------|
-| `POST /documents/upload` | 上传标准文件（自动切片+注册监控） |
-| `GET /documents` | 文档列表（筛选+分页） |
-| `POST /ask` | RAG 问答（混合检索+LLM） |
-| `POST /ask/stream` | SSE 流式问答 |
-| `GET /documents/stats` | 统计信息 |
-| `GET /standards/watchdog` | 标准状态监控 |
-| `POST /standards/watchdog/backfill-all` | 一键回填已有文档 |
+含 API + MySQL + Nginx 三服务。
 
 ## 项目结构
 
 ```
 standard_ai/
-├── main.py                 # FastAPI 入口
-├── models.py               # SQLAlchemy 数据模型
-├── schemas.py              # Pydantic 请求/响应模型
-├── database.py             # 数据库连接配置
-├── requirements.txt        # Python 依赖
+├── main.py                      # FastAPI 入口
+├── config.py                    # 统一配置（.env 读取）
+├── database.py                  # 数据库连接
+├── models.py                    # ORM 模型（6 张表）
+├── schemas.py                   # Pydantic 模型
+├── logging_config.py            # 结构化日志
 ├── routers/
-│   ├── documents.py        # 文档管理+问答接口
-│   └── watchdog.py         # 标准监控接口
+│   ├── documents.py             # 文档+问答+对比+起草
+│   ├── auth.py                  # JWT 登录/注册/权限
+│   └── annotations.py           # 用户标注笔记
 ├── services/
-│   ├── document_service.py # 文档解析/切片/检索
-│   ├── llm_service.py      # DeepSeek 调用
-│   ├── embedding_service.py# 向量化服务
-│   ├── anaylysis_service.py# 文档分析
-│   └── watchdog_service.py # 标准监控服务
-├── standard_ai_frontend/   # Vue 3 前端
-│   └── src/
-│       ├── App.vue         # 主组件
-│       └── services/api.js # API 封装
-└── uploads/                # 上传文件存储（gitignore）
+│   ├── document_service.py      # 解析/切片/检索/提取
+│   ├── llm_service.py           # DeepSeek 调用
+│   ├── embedding_service.py     # 向量化
+│   ├── auth_service.py          # 密码哈希+JWT
+│   ├── vector_index.py          # faiss 索引
+│   └── cache.py                 # 内存缓存
+├── standard_ai_frontend/        # Vue 3 前端
+├── uploads/                     # 上传文件
+├── logs/                        # 日志文件
+├── Dockerfile
+└── docker-compose.yml
 ```
+
+## API 接口
+
+| 接口 | 说明 | 权限 |
+|------|------|:--:|
+| `POST /auth/register` | 注册 | 无 |
+| `POST /auth/login` | 登录 | 无 |
+| `POST /documents/upload` | 上传文件 | 管理员/工程师 |
+| `GET /documents` | 文档列表 | 所有角色 |
+| `POST /documents/{id}/chunks` | 生成切片 | 管理员/工程师 |
+| `POST /documents/{id}/analyze` | AI 分析 | 管理员/工程师 |
+| `DELETE /documents/{id}` | 删除文档 | 管理员/工程师 |
+| `POST /ask` | 问答 | 所有角色 |
+| `POST /ask/stream` | 流式问答 | 所有角色 |
+| `GET /documents/{id}/clauses` | 条款列表 | 所有角色 |
+| `POST /documents/{id}/draft-check` | 起草辅助 | 所有角色 |
+| `GET /documents/citations/graph` | 引用图谱 | 所有角色 |
+| `POST /annotations` | 添加标注 | 所有角色 |
+| `GET /health` | 健康检查 | 无 |
 
 ## License
 
