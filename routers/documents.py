@@ -752,6 +752,60 @@ async def update_document_by_id(document_id: int, patch_document: DocumentUpdate
             "document": document, }
 
 
+@router.get("/documents/{document_id}/clauses")
+def get_clauses(document_id: int, db: Session = Depends(get_db),
+                user: User = Depends(get_current_user)):
+    """获取文档的条款列表（起草辅助用）"""
+    clauses = services.document_service.extract_clauses(db, document_id)
+    return {"clauses": clauses}
+
+
+@router.post("/documents/{document_id}/draft-check")
+def draft_check(document_id: int, req: AskQuestion, db: Session = Depends(get_db),
+                user: User = Depends(get_current_user)):
+    """起草辅助：检查草案条款是否与现行标准冲突"""
+    # 获取该文档外的所有文档ID
+    from models import Document
+    all_docs = db.query(Document.id).filter(Document.id != document_id).all()
+    other_ids = [d[0] for d in all_docs]
+    if not other_ids:
+        return {"answer": "系统中暂无其他标准可供对比"}
+
+    # 用对比模式检索
+    results, conf, detail = services.document_service.hybrid_search_chunks(
+        db, req.question, req.limit, document_ids=other_ids
+    )
+    expanded = services.document_service.expand_search_results(db, results, depth=1)
+    refs = _build_references(db, results, expanded)
+    ctx = services.document_service._format_comparison_context(refs)
+
+    # 获取草案条款详情
+    clause_info = ""
+    if req.document_ids:
+        clause_chunks = db.query(DocumentChunk).filter(
+            DocumentChunk.document_id == document_id,
+            DocumentChunk.section_path.isnot(None)
+        ).all()
+        clause_info = "\n".join([f"- {c.section_path}: { (c.content or '')[:200]}" for c in clause_chunks[:5]])
+
+    prompt = (
+        f"你是标准起草审查专家。用户正在起草一份标准，需要检查草案条款是否与现行标准冲突。\n\n"
+        f"草案条款内容：\n{clause_info}\n\n"
+        f"用户问题：{req.question}\n\n"
+        f"现行标准参考资料：\n{ctx}\n\n"
+        f"请给出：1) 是否存在冲突 2) 差异对比 3) 修改建议"
+    )
+
+    answer = services.llm_service.generate_answer(prompt)
+    return {
+        "answer": answer,
+        "references": [{
+            "document_id": r["document_id"], "filename": r["filename"],
+            "section_path": r["section_path"], "source_label": r["source_label"],
+        } for r in refs[:5]],
+    }
+
+
 @router.delete("/documents/{document_id}", response_model=MessageOut)  # 根据标准文件的id去删除相对应的文件
 async def delete_document_by_id(document_id: int,
                                 db: Session = Depends(get_db),

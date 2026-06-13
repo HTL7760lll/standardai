@@ -300,6 +300,7 @@
             <template v-if="currentRole !== 'viewer'">
               <el-button size="small" text type="success" :loading="chunkLoadingId === row.id" @click.stop="handleGenerateChunks(row)">切片</el-button>
               <el-button size="small" text type="warning" @click.stop="handleAnalyze(row)">分析</el-button>
+              <el-button size="small" text type="info" @click.stop="openDraftCheck(row)">📝 起草辅助</el-button>
               <el-button v-if="currentRole === 'admin' || (currentRole === 'engineer')" size="small" text type="danger" @click.stop="handleDelete(row)">删除</el-button>
             </template>
           </template>
@@ -398,6 +399,21 @@
       </template>
     </el-dialog>
   </div>
+
+  <!-- ═══════════ 起草辅助弹窗 ═══════════ -->
+  <el-dialog v-model="showDraftDialog" title="📝 起草辅助 — 条款冲突检查" width="600px">
+    <div v-if="draftLoading" style="text-align:center;padding:20px;">加载条款列表中...</div>
+    <div v-else-if="draftClauses.length === 0" style="text-align:center;padding:20px;color:#999;">该文档暂无条款（请先生成切片）</div>
+    <div v-else>
+      <p style="color:#909399;font-size:13px;margin-bottom:12px;">选择草案条款，自动检查是否与现行标准冲突：</p>
+      <div v-for="cl in draftClauses" :key="cl.section_number" class="draft-clause-item"
+           @click="checkDraftClause(cl)" style="cursor:pointer;padding:8px 12px;margin-bottom:6px;border:1px solid #e4e7ed;border-radius:6px;transition:all .2s;">
+        <strong>{{ cl.section_number }}</strong>
+        <span style="color:#909399;margin-left:8px;font-size:12px;">{{ cl.section_path }}</span>
+      </div>
+    </div>
+    <p v-if="draftResult" style="margin-top:16px;white-space:pre-wrap;line-height:1.8;background:#f8f9fb;padding:12px;border-radius:6px;">{{ draftResult }}</p>
+  </el-dialog>
 
   <!-- ═══════════ 标注弹窗 ═══════════ -->
   <el-dialog v-model="showAnnotationDialog" title="添加标注笔记" width="460px">
@@ -567,6 +583,34 @@ function startAnnotation(ref) {
   annotationRef.value = ref
   annotationText.value = ''
   showAnnotationDialog.value = true
+}
+
+// ── 起草辅助 ──
+const showDraftDialog = ref(false)
+const draftClauses = ref([])
+const draftLoading = ref(false)
+const draftResult = ref('')
+const draftDocId = ref(null)
+
+async function openDraftCheck(row) {
+  showDraftDialog.value = true; draftLoading.value = true; draftResult.value = ''; draftClauses.value = []
+  draftDocId.value = row.id
+  try {
+    const res = await axios.get(`http://127.0.0.1:8000/documents/${row.id}/clauses`)
+    draftClauses.value = res.data.clauses || []
+  } catch { ElMessage.error('加载条款失败，请先生成切片') }
+  finally { draftLoading.value = false }
+}
+
+async function checkDraftClause(cl) {
+  draftResult.value = '检查中...'
+  try {
+    const res = await axios.post(`http://127.0.0.1:8000/documents/${draftDocId.value}/draft-check`, {
+      question: `草案第 ${cl.section_number} 条（${cl.section_path}）与现行标准中的相关要求是否冲突？如有，请列出差异和修改建议`,
+      limit: 5,
+    })
+    draftResult.value = res.data.answer || '未找到相关对比信息'
+  } catch { draftResult.value = '检查失败，请重试' }
 }
 
 async function saveAnnotation() {

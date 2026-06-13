@@ -32,6 +32,8 @@
 }
 .login-tab.active { color: #1a3a5c; border-bottom-color: #1a3a5c; }
 .login-error { color: #f56c6c; font-size: 13px; margin-bottom: 12px; }
+/* 起草辅助条款列表 */
+.draft-clause-item:hover { background: #f0f4fa; border-color: #409eff; }
 /* 响应式 */
 @media (max-width: 800px) {
   .login-card { flex-direction: column; width: 360px; }

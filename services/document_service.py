@@ -3029,6 +3029,29 @@ def extract_citation_relations(db) -> list[dict]:
     return relations
 
 
+def extract_clauses(db, document_id: int) -> list[dict]:
+    """提取文档的条款列表（从 clause 类型 chunks 的 section_path）"""
+    chunks = db.query(DocumentChunk).filter(
+        DocumentChunk.document_id == document_id,
+        DocumentChunk.chunk_type == "clause",
+        DocumentChunk.section_path.isnot(None),
+        DocumentChunk.section_path != "",
+    ).order_by(DocumentChunk.chunk_index).all()
+
+    clauses = []
+    seen = set()
+    for c in chunks:
+        path = c.section_path or ""
+        # 提取第一个条款编号，如 "5 技术要求 > 5.1 xxx" → "5.1"
+        import re
+        m = re.search(r'(\d+(?:\.\d+)*)', c.section_number or path)
+        num = m.group(1) if m else path[:20]
+        if num not in seen:
+            seen.add(num)
+            clauses.append({"section_number": num, "section_path": path, "chunk_id": c.id})
+    return clauses
+
+
 def build_citation_graph(db) -> dict:
     """构建标准引用关系图，返回 nodes + edges"""
     relations = extract_citation_relations(db)
