@@ -1,4 +1,8 @@
-from fastapi import APIRouter,HTTPException, Query, Depends,UploadFile,File,Form
+from fastapi import APIRouter,HTTPException, Query, Depends,UploadFile,File,Form, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
 from sqlalchemy.exc import SQLAlchemyError
 import services.document_service
 from schemas import (DocumentCreate, DocumentUpdate, DocumentOut, DocumentListResponse,
@@ -28,8 +32,9 @@ async def create_document(document: DocumentCreate, db: Session = Depends(get_db
             "document": new_document,
             }
 
-@router.post("/documents/upload", response_model=DocumentMessageOut) #新增标准文件接口，
-async def upload_document(file: UploadFile = File(...),
+@router.post("/documents/upload", response_model=DocumentMessageOut)
+@limiter.limit("10/minute")
+async def upload_document(request: Request, file: UploadFile = File(...),
                           standard_type:str =Form(...), #Form是普通字段，因为返回的值是普通字段不是JSON
                           industry:str =Form(...),
                           tags: str = Form(...),
@@ -219,7 +224,8 @@ def _make_ref(chunk, doc, score, match_type, source_label, priority):
 
 
 @router.post("/ask")
-def ask(request:AskQuestion,db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+def ask(req: Request, request:AskQuestion, db: Session = Depends(get_db)):
     # 确定检索范围：支持单文档、多文档对比、全库
     doc_ids = request.document_ids
     is_comparison = doc_ids is not None and len(doc_ids) >= 2
@@ -414,7 +420,8 @@ def ask(request:AskQuestion,db: Session = Depends(get_db)):
 
 
 @router.post("/ask/stream")
-async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+async def ask_stream(req: Request, request: AskQuestion, db: Session = Depends(get_db)):
     """
     SSE 流式问答接口。
     先推送检索元信息（references + recommendations），再逐 token 推送 LLM 生成内容。
@@ -521,7 +528,7 @@ async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
                     if content:
                         yield "data: {}\n\n".format(json.dumps({"type": "token", "content": content}, ensure_ascii=False))
             except Exception as e:
-                yield "data: {}\n\n".format(json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False))
+                yield "data: {}\n\n".format(json.dumps({"type": "error", "message": "生成回答时出错，请重试"}, ensure_ascii=False))
             yield "data: {}\n\n".format(json.dumps({"type": "done"}))
 
         return StreamingResponse(comparison_stream(), media_type="text/event-stream")
@@ -776,7 +783,7 @@ async def chunk_documents(document_id: int,db: Session = Depends(get_db)):
     try:
         text = services.document_service.parse_document(filepath)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="文档解析失败，请确认文件可读且未加密")
 
     if text is None or text.strip() == "":
         raise HTTPException(status_code=400, detail="文档解析结果为空，无法生成切片")

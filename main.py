@@ -3,6 +3,9 @@ import uuid
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from config import settings
 from logging_config import setup_logging, get_logger
 from routers.documents import router as documents_router
@@ -10,7 +13,10 @@ from routers.documents import router as documents_router
 setup_logging()
 logger = get_logger(__name__)
 
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 app = FastAPI(title=settings.APP_TITLE)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
 app.add_middleware(

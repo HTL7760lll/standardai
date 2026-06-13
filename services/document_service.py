@@ -443,6 +443,7 @@ def create_document(db, filename, standard_type, industry, tags, filepath: str |
 
 async def get_file(file):
     allowed_extensions = {".pdf", ".docx", ".txt"}
+    max_size = 50 * 1024 * 1024  # 50MB
     original_filename = file.filename
     if original_filename is None:
         return None
@@ -450,6 +451,9 @@ async def get_file(file):
     if suffix not in allowed_extensions:
         return None
     file_bytes = await file.read()
+    if len(file_bytes) > max_size:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=413, detail="文件过大，最大支持 50MB")
     logger.info(f"上传文件读取字节数：{len(file_bytes)}")
     saved_name = uuid.uuid4().hex + suffix
     filepath = UPLOAD_DIR / saved_name
