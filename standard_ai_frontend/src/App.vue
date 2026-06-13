@@ -38,7 +38,8 @@
             <div :class="['chat-bubble', msg.role === 'user' ? 'bubble-user' : 'bubble-ai']">
               <div class="bubble-avatar">{{ msg.role === 'user' ? '👤' : '🤖' }}</div>
               <div class="bubble-content">
-                <div class="bubble-text">{{ msg.content }}</div>
+                <div class="bubble-text" v-if="msg.role === 'user'">{{ msg.content }}</div>
+                <div class="bubble-text markdown-body" v-else v-html="renderMarkdown(msg.content)"></div>
               </div>
             </div>
             <!-- 自动文档匹配提示 -->
@@ -52,7 +53,13 @@
 
             <!-- 流式生成中指示 -->
             <div v-if="msg.role === 'ai' && msg.streaming" class="streaming-indicator">
-              <span class="streaming-dot"></span> AI 正在生成回答...
+              <span class="streaming-dot"></span>
+              {{ msg.refsCount ? '已检索到 ' + msg.refsCount + ' 条参考，' : '' }}AI 正在生成回答...
+            </div>
+
+            <!-- 错误重试 -->
+            <div v-if="msg.role === 'ai' && msg.isError && !msg.streaming" style="margin-top:6px;">
+              <el-button size="small" type="warning" text @click="retryAsk(msg)">🔄 重新生成</el-button>
             </div>
 
             <!-- 对比模式标签 -->
@@ -168,6 +175,7 @@
                 </el-select>
               </el-tooltip>
             </div>
+            <el-button text size="small" @click="clearChat" :disabled="chatHistory.length === 0">清空对话</el-button>
             <el-button type="primary" :loading="asking" @click="submitAsk" class="send-btn">发送</el-button>
           </div>
         </div>
@@ -355,6 +363,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { UploadFilled, Upload, Search } from '@element-plus/icons-vue'
 import { askQuestion, askStream, generateChunks, getDocuments, uploadDocument, analyzeDocument, getDocumentStats, searchDocuments, deleteDocument } from './services/api'
 import axios from 'axios'
+import { marked } from 'marked'
 import * as echarts from 'echarts'
 
 // ── 视图 ──
@@ -413,6 +422,12 @@ const typeChartRef = ref(null)
 const industryChartRef = ref(null)
 let typeChart = null
 let industryChart = null
+
+// ── Markdown 渲染 ──
+function renderMarkdown(text) {
+  if (!text) return ''
+  return marked(text, { breaks: true, gfm: true })
+}
 
 // ═══════════ 方法 ═══════════
 
@@ -619,6 +634,7 @@ async function submitAsk() {
         aiMsg.recommendations = event.recommendations || null
         aiMsg.isComparison = event.is_comparison || false
         aiMsg.comparisonCount = event.comparison_count || 0
+        aiMsg.refsCount = (event.references || []).length
         if (event.auto_matched_document) {
           askDocIds.value = [event.auto_matched_document.document_id]
           aiMsg.autoMatched = event.auto_matched_document
@@ -638,6 +654,7 @@ async function submitAsk() {
   } catch (e) {
     aiMsg.content = aiMsg.content || ('抱歉，请求失败：' + (e?.message || '未知错误'))
     aiMsg.streaming = false
+    aiMsg.isError = true
   } finally {
     aiMsg.streaming = false
     asking.value = false
@@ -645,10 +662,30 @@ async function submitAsk() {
   }
 }
 
-// ── 追问/推荐交互 ──
+// ── 追问/重试/清空 ──
 function clickFollowUp(text) {
   question.value = text
   submitAsk()
+}
+
+function retryAsk(msg) {
+  // 找到该消息在历史中的位置，获取上一个用户问题重试
+  const idx = chatHistory.value.indexOf(msg)
+  if (idx > 0) {
+    const userMsg = chatHistory.value[idx - 1]
+    if (userMsg.role === 'user') {
+      // 移除该 AI 消息
+      chatHistory.value.splice(idx, 1)
+      question.value = userMsg.content
+      setTimeout(() => submitAsk(), 100)
+    }
+  }
+}
+
+function clearChat() {
+  chatHistory.value = []
+  ElMessage.success('对话已清空')
+}
 }
 
 function selectRecommendedDoc(rec) {
