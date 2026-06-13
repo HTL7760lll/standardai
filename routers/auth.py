@@ -1,7 +1,7 @@
 """
 认证接口 — 登录 / 注册
 """
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Header
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from database import get_db
@@ -47,7 +47,7 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
 
 def require_role(*roles: str):
     """依赖注入：检查当前用户角色。用法: Depends(require_role('admin','engineer'))"""
-    def checker(db: Session = Depends(get_db), authorization: str | None = None) -> User:
+    def checker(db: Session = Depends(get_db), authorization: str | None = Header(None)) -> User:
         user = get_current_user(db, authorization)
         if user.role not in roles:
             raise HTTPException(403, f"权限不足，需要角色: {', '.join(roles)}")
@@ -55,7 +55,7 @@ def require_role(*roles: str):
     return checker
 
 
-def get_current_user(db: Session = Depends(get_db), authorization: str | None = None) -> User:
+def get_current_user(db: Session = Depends(get_db), authorization: str | None = Header(None)) -> User:
     """从 Authorization header 解析 JWT 并返回用户"""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "未登录，请先登录")
