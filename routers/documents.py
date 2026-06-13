@@ -615,16 +615,26 @@ async def ask_stream(request: AskQuestion, db: Session = Depends(get_db)):
             "selected_count": assembled.get("selected_count", 0),
         }, ensure_ascii=False))
 
-        # 流式推送答案，逐字符模拟真实打字效果
-        answer_text = assembled["answer"]
-        for i, char in enumerate(answer_text):
-            yield "data: {}\n\n".format(json.dumps({
-                "type": "token",
-                "content": char,
-            }, ensure_ascii=False))
-            # 每 3 个字符略微停顿，模拟自然流式输出
-            if i % 3 == 2:
-                await asyncio.sleep(0.02)
+        # 真正流式推送：调用 DeepSeek stream API，token 逐个到达
+        # 构建 prompt（含证据句子 + 引用）
+        evidence_text = "\n".join([
+            f"[{s['sentence_id']}] {s.get('section_path', '')}: {s['text']}"
+            for s in evidence_sentences[:10]
+        ])
+        stream_prompt = (
+            f"你是标准文档问答助手。请根据以下证据回答用户问题。\n\n"
+            f"用户问题：{request.question}\n\n"
+            f"证据句子：\n{evidence_text}\n\n"
+            f"请严格引用证据，注明章节路径，不要编造。"
+        )
+        stream = services.llm_service.generate_answer_stream(stream_prompt)
+        for chunk in stream:
+            content = chunk.choices[0].delta.content or ""
+            if content:
+                yield "data: {}\n\n".format(json.dumps({
+                    "type": "token",
+                    "content": content,
+                }, ensure_ascii=False))
 
         yield "data: {}\n\n".format(json.dumps({
             "type": "done",
