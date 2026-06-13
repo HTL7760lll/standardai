@@ -2178,16 +2178,17 @@ def extract_search_terms(question: str) -> list[str]:
 
 
 def extract_keyword_terms(db, terms: list[str], limit: int = 5, document_ids: list[int] | None = None):
-    """多关键词 OR 检索，支持多标准"""
-    conditions = []
-    for term in terms:
-        if term and term.strip():
-            conditions.append(DocumentChunk.content.contains(term.strip()))
-
-    if not conditions:
+    """多关键词 FULLTEXT 检索（替代 LIKE 全表扫描）"""
+    clean_terms = [t.strip() for t in terms if t and t.strip() and len(t.strip()) >= 2]
+    if not clean_terms:
         return []
 
-    query = db.query(DocumentChunk).filter(or_(*conditions))
+    # MySQL FULLTEXT IN BOOLEAN MODE: 不加 + 前缀 = OR 逻辑（任意词命中即可）
+    ft_query = " ".join(clean_terms)
+
+    query = db.query(DocumentChunk).filter(
+        DocumentChunk.content.match(ft_query)
+    )
     if document_ids:
         query = query.filter(DocumentChunk.document_id.in_(document_ids))
     return query.limit(limit).all()
