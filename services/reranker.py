@@ -76,11 +76,15 @@ def rerank(question: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
         pairs.append([question, content[:500]])
 
     # 批量打分
-    scores = model.predict(pairs, show_progress_bar=False)
+    raw_scores = model.predict(pairs, show_progress_bar=False)
+
+    # Sigmoid归一化到 0-1（CrossEncoder 原始输出是无界 logits）
+    import math
+    scores = [1.0 / (1.0 + math.exp(-s)) for s in raw_scores]
 
     # 更新分数并排序
     for i, score in enumerate(scores):
-        candidates[i]["score"] = float(score)
+        candidates[i]["score"] = round(score, 4)
         candidates[i]["match_type"] = candidates[i].get("match_type", "keyword") + "+rerank"
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -117,15 +121,11 @@ def check_faithfulness(answer: str, chunks: list[str]) -> dict:
 
     for sent in sentences:
         # 每句 vs 原文，用 CrossEncoder 打分
-        score = float(model.predict([[sent, context]], show_progress_bar=False)[0])
+        import math
+        raw = float(model.predict([[sent, context]], show_progress_bar=False)[0])
+        score = 1.0 / (1.0 + math.exp(-raw))  # sigmoid 归一化到 0-1
 
-        # bge-reranker 输出范围不固定，归一化到 0-1
-        if score < -2:
-            is_supported = False
-        elif score > 0:
-            is_supported = True
-        else:
-            is_supported = score > -2.0
+        is_supported = score >= 0.5  # 大于 0.5 表示有依据
 
         if not is_supported:
             flagged.append({"sentence": sent, "score": round(score, 3)})
