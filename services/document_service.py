@@ -2500,10 +2500,14 @@ def hybrid_search_chunks(db, question: str, limit: int = 5, document_ids: list[i
             "match_type": match_type,
         }
 
-    # ── 4维加权置信度判定 ──
+    # ── CrossEncoder 重排序 ──
     results = list(result_map.values())
     results.sort(key=lambda r: r["score"], reverse=True)
-    top_results = results[:limit]
+    candidates = results[:min(len(results), limit * 4)]  # 取 more candidates 做精排
+    import services.reranker as reranker
+    top_results = reranker.rerank(question, candidates, top_k=limit)
+
+    # ── 4维加权置信度判定 ──
 
     if not top_results:
         return [], "none", {
