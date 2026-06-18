@@ -52,9 +52,13 @@ export function askQuestion(payload) {
  */
 export async function* askStream(payload) {
   const url = `${baseURL}/ask/stream`
+  const token = localStorage.getItem('token')
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { 'Authorization': 'Bearer ' + token } : {}),
+    },
     body: JSON.stringify(payload),
   })
 

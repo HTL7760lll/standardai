@@ -2,12 +2,14 @@
 统一配置管理 —— 所有凭据和参数从 .env 读取
 优先级：环境变量 > .env 文件 > 默认值
 """
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+ENV_PATH = Path(__file__).parent / ".env"
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(ENV_PATH),
         env_file_encoding="utf-8",
         extra="ignore",
     )
