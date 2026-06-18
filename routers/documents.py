@@ -228,43 +228,43 @@ def _make_ref(chunk, doc, score, match_type, source_label, priority):
 
 @router.post("/ask")
 @limiter.limit("30/minute")
-def ask(req: Request, request:AskQuestion, db: Session = Depends(get_db),
+def ask(request: Request, body: AskQuestion, db: Session = Depends(get_db),
         user: User = Depends(get_current_user)):
     # 确定检索范围：支持单文档、多文档对比、全库
-    doc_ids = request.document_ids
+    doc_ids = body.document_ids
     is_comparison = doc_ids is not None and len(doc_ids) >= 2
     auto_matched_doc = None
 
     # 自动文档匹配（仅在未指定文档时）
     if doc_ids is None:
-        matched_id = services.document_service._match_question_to_documents(db, request.question)
+        matched_id = services.document_service._match_question_to_documents(db, body.question)
         if matched_id is not None:
             doc_ids = [matched_id]
             auto_matched_doc = services.document_service.get_document_by_id(db, matched_id)
 
     results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
-        db, request.question, request.limit, document_ids=doc_ids
+        db, body.question, body.limit, document_ids=doc_ids
     )
 
     # 自动匹配回退：如果限定文档无结果，回退到全库搜索
     auto_match_fallback = False
-    if len(results) == 0 and doc_ids is not None and request.document_ids is None:
+    if len(results) == 0 and doc_ids is not None and body.document_ids is None:
         auto_match_fallback = True
         doc_ids = None
         results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
-            db, request.question, request.limit, document_ids=None
+            db, body.question, body.limit, document_ids=None
         )
 
     # 零结果查询扩展：用简化查询重试一次
     if len(results) == 0:
-        expanded_q = services.document_service._expand_query_synonyms(request.question)
-        if expanded_q != request.question:
+        expanded_q = services.document_service._expand_query_synonyms(body.question)
+        if expanded_q != body.question:
             results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
-                db, expanded_q, request.limit, document_ids=doc_ids
+                db, expanded_q, body.limit, document_ids=doc_ids
             )
 
-    search_terms = services.document_service.extract_search_terms(request.question)
-    question_intent = services.document_service.infer_question_intent(request.question)
+    search_terms = services.document_service.extract_search_terms(body.question)
+    question_intent = services.document_service.infer_question_intent(body.question)
 
     # 联动检索 + 引用构建
     expanded_results = services.document_service.expand_search_results(db, results, depth=1)
@@ -272,7 +272,7 @@ def ask(req: Request, request:AskQuestion, db: Session = Depends(get_db),
 
     if len(references) == 0:
         return {
-            "question": request.question,
+            "question": body.question,
             "answer": "没有找到相关参考资料，暂时无法回答。请确认：1) 已上传标准文件 2) 已为该文件生成切片。",
             "references": [],
             "retrieval_confidence": "none",
@@ -290,10 +290,10 @@ def ask(req: Request, request:AskQuestion, db: Session = Depends(get_db),
         # 按标准分组构建对比上下文
         comparison_context = services.document_service._format_comparison_context(references)
         comparison_answer = services.llm_service.generate_comparison_answer(
-            request.question, comparison_context, references
+            body.question, comparison_context, references
         )
         return {
-            "question": request.question,
+            "question": body.question,
             "question_intent": question_intent,
             "search_mode": "comparison",
             "search_terms": search_terms,
@@ -327,13 +327,13 @@ def ask(req: Request, request:AskQuestion, db: Session = Depends(get_db),
 
     # 层1：从 references 抽取与问题最相关的证据句子
     evidence_sentences = services.document_service.extract_evidence_sentences(
-        request.question, references
+        body.question, references
     )
 
     if not evidence_sentences:
         # 有 references 但无足够相似的句子 → 诚实告知
         return {
-            "question": request.question,
+            "question": body.question,
             "question_intent": question_intent,
             "search_terms": search_terms,
             "answer": (
@@ -367,7 +367,7 @@ def ask(req: Request, request:AskQuestion, db: Session = Depends(get_db),
 
     # 层2：LLM 从候选句子中选择相关句子并排序（JSON 结构化输出）
     selection = services.llm_service.select_evidence_sentences(
-        request.question, evidence_sentences
+        body.question, evidence_sentences
     )
 
     # 层3：组装最终答案 + 逐句验证来源可追溯
@@ -376,17 +376,17 @@ def ask(req: Request, request:AskQuestion, db: Session = Depends(get_db),
     )
 
     # ── 追问建议 ──
-    follow_up_questions = _generate_follow_ups(request.question, question_intent, references)
+    follow_up_questions = _generate_follow_ups(body.question, question_intent, references)
 
     # ── 相关标准推荐（仅单文档模式下推荐）──
     recommendations = None
     if not is_comparison and doc_ids and len(doc_ids) == 1:
         recommendations = services.document_service.recommend_related_standards(
-            db, doc_ids[0], request.question
+            db, doc_ids[0], body.question
         )
 
     return {
-        "question": request.question,
+        "question": body.question,
         "question_intent": question_intent,
         "search_mode": "hybrid",
         "search_terms": search_terms,
@@ -425,45 +425,45 @@ def ask(req: Request, request:AskQuestion, db: Session = Depends(get_db),
 
 @router.post("/ask/stream")
 @limiter.limit("30/minute")
-async def ask_stream(req: Request, request: AskQuestion, db: Session = Depends(get_db),
+async def ask_stream(request: Request, body: AskQuestion, db: Session = Depends(get_db),
                      user: User = Depends(get_current_user)):
     """
     SSE 流式问答接口。
     先推送检索元信息（references + recommendations），再逐 token 推送 LLM 生成内容。
     """
     # ── 0. 自动文档匹配 ──
-    doc_ids = request.document_ids
+    doc_ids = body.document_ids
     auto_matched_doc = None
     if doc_ids is None:
-        matched_id = services.document_service._match_question_to_documents(db, request.question)
+        matched_id = services.document_service._match_question_to_documents(db, body.question)
         if matched_id is not None:
             doc_ids = [matched_id]
             auto_matched_doc = services.document_service.get_document_by_id(db, matched_id)
 
     # ── 1. 检索阶段（同步，和 /ask 逻辑一致）──
     results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
-        db, request.question, request.limit, document_ids=doc_ids
+        db, body.question, body.limit, document_ids=doc_ids
     )
 
     # 自动匹配回退：如果限定文档无结果，回退到全库搜索
     auto_match_fallback = False
-    if len(results) == 0 and doc_ids is not None and request.document_ids is None:
+    if len(results) == 0 and doc_ids is not None and body.document_ids is None:
         auto_match_fallback = True
         doc_ids = None
         results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
-            db, request.question, request.limit, document_ids=None
+            db, body.question, body.limit, document_ids=None
         )
 
     # 零结果查询扩展
     if len(results) == 0:
-        expanded_q = services.document_service._expand_query_synonyms(request.question)
-        if expanded_q != request.question:
+        expanded_q = services.document_service._expand_query_synonyms(body.question)
+        if expanded_q != body.question:
             results, confidence, confidence_detail = services.document_service.hybrid_search_chunks(
-                db, expanded_q, request.limit, document_ids=doc_ids
+                db, expanded_q, body.limit, document_ids=doc_ids
             )
 
-    search_terms = services.document_service.extract_search_terms(request.question)
-    question_intent = services.document_service.infer_question_intent(request.question)
+    search_terms = services.document_service.extract_search_terms(body.question)
+    question_intent = services.document_service.infer_question_intent(body.question)
     expanded_results = services.document_service.expand_search_results(db, results, depth=1)
 
     # 引用构建
@@ -492,7 +492,7 @@ async def ask_stream(req: Request, request: AskQuestion, db: Session = Depends(g
         return StreamingResponse(empty_stream(), media_type="text/event-stream")
 
     # ── 对比模式（流式版）──
-    is_comparison = request.document_ids is not None and len(request.document_ids) >= 2
+    is_comparison = body.document_ids is not None and len(body.document_ids) >= 2
     if is_comparison:
         async def comparison_stream():
             # 先发 meta
@@ -515,7 +515,7 @@ async def ask_stream(req: Request, request: AskQuestion, db: Session = Depends(g
                 "recommendations": None,
                 "follow_up_questions": [],
                 "is_comparison": True,
-                "comparison_count": len(request.document_ids),
+                "comparison_count": len(body.document_ids),
                 "auto_matched_document": {
                     "document_id": auto_matched_doc.id,
                     "filename": auto_matched_doc.filename,
@@ -525,7 +525,7 @@ async def ask_stream(req: Request, request: AskQuestion, db: Session = Depends(g
             # 生成对比回答并逐token输出
             comparison_context = services.document_service._format_comparison_context(references)
             stream = services.llm_service.generate_comparison_answer_stream(
-                request.question, comparison_context, references
+                body.question, comparison_context, references
             )
             try:
                 for chunk in stream:
@@ -542,18 +542,18 @@ async def ask_stream(req: Request, request: AskQuestion, db: Session = Depends(g
 
     # 层1：抽取证据句子
     evidence_sentences = services.document_service.extract_evidence_sentences(
-        request.question, references
+        body.question, references
     )
 
     # ── 3. 推荐（仅单文档模式）──
     recommendations = None
     if doc_ids and len(doc_ids) == 1:
         recommendations = services.document_service.recommend_related_standards(
-            db, doc_ids[0], request.question
+            db, doc_ids[0], body.question
         )
 
     # ── 4. 追问建议 ──
-    follow_up_questions = _generate_follow_ups(request.question, question_intent, references)
+    follow_up_questions = _generate_follow_ups(body.question, question_intent, references)
 
     # ── 5. SSE 流式响应 ──
     async def event_stream():
@@ -610,7 +610,7 @@ async def ask_stream(req: Request, request: AskQuestion, db: Session = Depends(g
         loop = asyncio.get_event_loop()
         selection = await loop.run_in_executor(
             None, services.llm_service.select_evidence_sentences,
-            request.question, evidence_sentences
+            body.question, evidence_sentences
         )
 
         # 层3：组装验证
@@ -646,7 +646,7 @@ async def ask_stream(req: Request, request: AskQuestion, db: Session = Depends(g
             f"【参考资料格式】类型标注了资料角色，章节路径用于条款引用，"
             f"直接命中=最相关资料，关联上下文=辅助背景。\n\n"
             f"{intent_hint}"
-            f"用户问题：{request.question}\n\n"
+            f"用户问题：{body.question}\n\n"
             f"参考资料：\n{ref_text}"
         )
         stream = services.llm_service.generate_answer_stream(stream_prompt)
