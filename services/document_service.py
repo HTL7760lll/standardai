@@ -1741,7 +1741,16 @@ def _chunk_fallback_paragraphs(
         char_pos = sum(len(p) + 2 for p in paragraphs[:i])
         page = _get_page_for_position(char_to_page, char_pos)
 
-        path = f"{section_label}（{part_num}/{total_estimate}）" if total_estimate > 1 else section_label
+        # 路径含标准编号/名称，直观识别
+        std_num = std_info.get("standard_number", "")
+        std_name = std_info.get("standard_name", "")
+        if std_num or std_name:
+            label = f"{std_num or ''} {std_name or ''}".strip()
+            if len(label) > 30:
+                label = label[:30]
+        else:
+            label = section_label
+        path = f"{label}（{part_num}/{total_estimate}）" if total_estimate > 1 else label
         prefix = _build_chunk_prefix(std_info, path, page)
         chunks.append({
             "content": prefix + merged,
