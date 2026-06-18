@@ -85,3 +85,52 @@ def rerank(question: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:top_k]
+
+
+def check_faithfulness(answer: str, chunks: list[str]) -> dict:
+    """
+    忠实度检测：用 CrossEncoder 逐句判断回答是否被检索原文支撑。
+    - answer: LLM 生成的完整回答
+    - chunks: 检索到的原文 chunk 列表
+    返回 {"score": 0.0-1.0, "flagged": [可疑句子列表]}
+    """
+    if not answer or not chunks:
+        return {"score": 1.0, "flagged": []}
+
+    # 拆回答为句子
+    import re
+    sentences = [s.strip() for s in re.split(r'[。！？\n]', answer) if len(s.strip()) >= 8]
+
+    if not sentences:
+        return {"score": 1.0, "flagged": []}
+
+    # 合并原文为一段
+    context = " ".join([c[:300] for c in chunks[:5]])
+
+    try:
+        model = get_reranker()
+    except Exception:
+        return {"score": 0.5, "flagged": []}
+
+    flagged = []
+    total_score = 0.0
+
+    for sent in sentences:
+        # 每句 vs 原文，用 CrossEncoder 打分
+        score = float(model.predict([[sent, context]], show_progress_bar=False)[0])
+
+        # bge-reranker 输出范围不固定，归一化到 0-1
+        if score < -2:
+            is_supported = False
+        elif score > 0:
+            is_supported = True
+        else:
+            is_supported = score > -2.0
+
+        if not is_supported:
+            flagged.append({"sentence": sent, "score": round(score, 3)})
+
+        total_score += 1.0 if is_supported else 0.0
+
+    faithfulness = total_score / len(sentences) if sentences else 1.0
+    return {"score": round(faithfulness, 3), "flagged": flagged}

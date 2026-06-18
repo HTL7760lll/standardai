@@ -413,6 +413,10 @@ def ask(request: Request, body: AskQuestion, db: Session = Depends(get_db),
         "recommendations": recommendations,
         "retrieval_confidence": confidence,
         "confidence_detail": confidence_detail,
+        "faithfulness": services.reranker.check_faithfulness(
+            assembled["answer"],
+            [r["content"] for r in references[:5]]
+        ),
         "is_comparison": is_comparison,
         "comparison_count": len(doc_ids) if doc_ids else 0,
         "auto_matched_document": {
