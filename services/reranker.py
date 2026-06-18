@@ -1,6 +1,9 @@
 """
 CrossEncoder 重排序 — 对检索候选结果精排，提升 top-k 准确率
 """
+import os
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 from sentence_transformers import CrossEncoder
 from logging_config import get_logger
 
