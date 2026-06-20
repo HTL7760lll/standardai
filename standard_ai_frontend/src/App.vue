@@ -647,7 +647,9 @@ let industryChart = null
 // ── Markdown 渲染 ──
 function renderMarkdown(text) {
   if (!text) return ''
-  return marked(text, { breaks: true, gfm: true })
+  // 合并多余空行：3+ 换行 → 2 换行（标准 markdown 段落间距）
+  const clean = text.replace(/\n{3,}/g, '\n\n')
+  return marked(clean, { breaks: false, gfm: true })
 }
 
 // ═══════════ 方法 ═══════════
