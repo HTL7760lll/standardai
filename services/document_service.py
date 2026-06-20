@@ -2707,6 +2707,73 @@ def _strip_chunk_prefix(content: str) -> str:
     return _CONTENT_PREFIX_RE.sub('', content).strip()
 
 
+# chunk_type → 中文映射（供 build_references 使用）
+_CHUNK_TYPE_CN = {
+    "cover": "封面", "preface": "前言/引言", "scope": "范围",
+    "references": "规范性引用文件", "term": "术语定义", "clause": "正文条款",
+    "table": "表格", "figure": "图示/公式", "appendix": "附录",
+}
+
+
+def _make_ref(chunk, doc, score, match_type, source_label, priority):
+    """构建单个 reference 条目"""
+    raw = chunk.content or ""
+    clean = _strip_chunk_prefix(raw)
+    limit = 800 if chunk.chunk_type == "table" else 1000
+    if len(clean) > limit:
+        clean = clean[:limit] + "\n[...内容过长，已截断...]"
+    return {
+        "document_id": chunk.document_id,
+        "chunk_id": chunk.id,
+        "filename": doc.filename if doc else None,
+        "chunk_index": chunk.chunk_index,
+        "chunk_type": chunk.chunk_type,
+        "chunk_type_cn": _CHUNK_TYPE_CN.get(chunk.chunk_type, chunk.chunk_type or "未知"),
+        "section_path": chunk.section_path,
+        "page_number": chunk.page_number,
+        "score": score,
+        "content": clean,
+        "content_length": len(raw),
+        "match_type": match_type,
+        "source_label": source_label,
+        "priority": priority,
+    }
+
+
+def build_references(db, results: list, expanded_results: list) -> list[dict]:
+    """从检索结果构建 references 列表（去重 + 评分 + 截断 + 来源标签）"""
+    direct_ids = {item["chunk"].id for item in results}
+    direct_scores = {item["chunk"].id: item["score"] for item in results}
+    direct_match_types = {item["chunk"].id: item["match_type"] for item in results}
+
+    references = []
+    for chunk in expanded_results:
+        doc = get_document_by_id(db, chunk.document_id)
+
+        if chunk.id in direct_ids:
+            mt = direct_match_types.get(chunk.id, "linked")
+            references.append(_make_ref(chunk, doc,
+                score=direct_scores.get(chunk.id, 0.0),
+                match_type=mt,
+                source_label="直接命中",
+                priority=0 if mt in ("keyword", "hybrid") else 1))
+        else:
+            is_parent = any(item["chunk"].parent_chunk_id == chunk.id for item in results)
+            is_child = any(chunk.parent_chunk_id and chunk.parent_chunk_id == item["chunk"].id for item in results)
+            if is_parent:
+                references.append(_make_ref(chunk, doc, score=0.0, match_type="linked",
+                    source_label="关联上下文-父级", priority=2))
+            elif is_child:
+                references.append(_make_ref(chunk, doc, score=0.0, match_type="linked",
+                    source_label="关联上下文-子级", priority=3))
+            else:
+                references.append(_make_ref(chunk, doc, score=0.0, match_type="linked",
+                    source_label="关联上下文", priority=2))
+
+    references.sort(key=lambda r: (r["priority"], -r["score"]))
+    return references
+
+
 # ═══════════════════════════════════════════════════════════════
 # 相关标准推荐（多维度融合）
 # ═══════════════════════════════════════════════════════════════

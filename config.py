@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     JWT_SECRET: str = "change-me-in-production-use-a-long-random-string-here"
     JWT_EXPIRE_HOURS: int = 24
 
+    # ── Agent ──
+    AGENT_MAX_TURNS: int = 5
+
     # ── 应用 ──
     APP_TITLE: str = "智能标准文档管理与RAG问答系统"
     UPLOAD_DIR: str = "uploads"

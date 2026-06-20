@@ -160,72 +160,6 @@ def _generate_follow_ups(question: str, intent: str, references: list[dict]) -> 
 # 共享引用构建（/ask 和 /ask/stream 共用）
 # ═══════════════════════════════════════════════════════════════
 
-_CHUNK_TYPE_CN = {
-    "cover": "封面", "preface": "前言/引言", "scope": "范围",
-    "references": "规范性引用文件", "term": "术语定义", "clause": "正文条款",
-    "table": "表格", "figure": "图示/公式", "appendix": "附录",
-}
-
-
-def _build_references(db, results, expanded_results):
-    """从检索结果构建 references 列表（去重 + 评分 + 截断 + 来源标签）"""
-    direct_ids = {item["chunk"].id for item in results}
-    direct_scores = {item["chunk"].id: item["score"] for item in results}
-    direct_match_types = {item["chunk"].id: item["match_type"] for item in results}
-
-    references = []
-    for chunk in expanded_results:
-        doc = services.document_service.get_document_by_id(db, chunk.document_id)
-
-        if chunk.id in direct_ids:
-            mt = direct_match_types.get(chunk.id, "linked")
-            references.append(_make_ref(chunk, doc,
-                score=direct_scores.get(chunk.id, 0.0),
-                match_type=mt,
-                source_label="直接命中",
-                priority=0 if mt in ("keyword", "hybrid") else 1))
-        else:
-            is_parent = any(item["chunk"].parent_chunk_id == chunk.id for item in results)
-            is_child = any(chunk.parent_chunk_id and chunk.parent_chunk_id == item["chunk"].id for item in results)
-            if is_parent:
-                references.append(_make_ref(chunk, doc, score=0.0, match_type="linked",
-                    source_label="关联上下文-父级", priority=2))
-            elif is_child:
-                references.append(_make_ref(chunk, doc, score=0.0, match_type="linked",
-                    source_label="关联上下文-子级", priority=3))
-            else:
-                references.append(_make_ref(chunk, doc, score=0.0, match_type="linked",
-                    source_label="关联上下文", priority=2))
-
-    references.sort(key=lambda r: (r["priority"], -r["score"]))
-    return references
-
-
-def _make_ref(chunk, doc, score, match_type, source_label, priority):
-    """构建单个 reference 条目"""
-    raw = chunk.content or ""
-    clean = services.document_service._strip_chunk_prefix(raw)
-    limit = 800 if chunk.chunk_type == "table" else 1000
-    if len(clean) > limit:
-        clean = clean[:limit] + "\n[...内容过长，已截断...]"
-    return {
-        "document_id": chunk.document_id,
-        "chunk_id": chunk.id,
-        "filename": doc.filename if doc else None,
-        "chunk_index": chunk.chunk_index,
-        "chunk_type": chunk.chunk_type,
-        "chunk_type_cn": _CHUNK_TYPE_CN.get(chunk.chunk_type, chunk.chunk_type or "未知"),
-        "section_path": chunk.section_path,
-        "page_number": chunk.page_number,
-        "score": score,
-        "content": clean,
-        "content_length": len(raw),
-        "match_type": match_type,
-        "source_label": source_label,
-        "priority": priority,
-    }
-
-
 @router.post("/ask")
 @limiter.limit("30/minute")
 def ask(request: Request, body: AskQuestion, db: Session = Depends(get_db),
@@ -268,7 +202,7 @@ def ask(request: Request, body: AskQuestion, db: Session = Depends(get_db),
 
     # 联动检索 + 引用构建
     expanded_results = services.document_service.expand_search_results(db, results, depth=1)
-    references = _build_references(db, results, expanded_results)
+    references = services.document_service.build_references(db, results, expanded_results)
 
     if len(references) == 0:
         return {
@@ -680,6 +614,115 @@ async def ask_stream(request: Request, body: AskQuestion, db: Session = Depends(
     )
 
 
+# ═══════════════════════════════════════════════════════════════
+# Agent 工具调用端点
+# ═══════════════════════════════════════════════════════════════
+
+@router.post("/ask/agent")
+@limiter.limit("30/minute")
+def ask_agent(
+    request: Request,
+    body: AskQuestion,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Agent-based Q&A with tool calling.
+    LLM 可执行多次检索、展开上下文、获取具体条款，迭代修正回答。
+
+    事件类型:
+    - tool_call: LLM 决定调用工具
+    - tool_result: 工具返回结果
+    - token: 最终回答 token
+    """
+    import services.agent_service as agent_service
+
+    result = agent_service.run_agent(
+        db=db,
+        question=body.question,
+        document_ids=body.document_ids,
+    )
+
+    refs = result.get("references", [])[:10]
+
+    # faithfulness check
+    import services.reranker as reranker
+    faithfulness = None
+    if result.get("answer") and refs:
+        faithfulness = reranker.check_faithfulness(
+            result["answer"],
+            [r.get("content", "") for r in refs[:5]],
+        )
+
+    return {
+        "question": body.question,
+        "answer": result["answer"],
+        "tool_calls": result["tool_calls"],
+        "references": [{
+            "document_id": r.get("document_id"),
+            "filename": r.get("filename"),
+            "chunk_index": r.get("chunk_index"),
+            "chunk_type": r.get("chunk_type"),
+            "chunk_type_cn": r.get("chunk_type_cn"),
+            "section_path": r.get("section_path"),
+            "page_number": r.get("page_number"),
+            "score": r.get("score"),
+            "content_preview": (r.get("content") or "")[:300],
+            "content_length": r.get("content_length"),
+            "match_type": r.get("match_type"),
+            "source_label": r.get("source_label"),
+        } for r in refs],
+        "turn_count": result["turn_count"],
+        "faithfulness": faithfulness,
+    }
+
+
+@router.post("/ask/agent/stream")
+@limiter.limit("30/minute")
+async def ask_agent_stream(
+    request: Request,
+    body: AskQuestion,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    SSE 流式 Agent 端点。
+    事件类型:
+    - meta         初始信息
+    - tool_call    LLM 决定调工具，含 name + arguments
+    - tool_status  工具执行中
+    - tool_result  工具返回结果（含 result_preview）
+    - token        最终回答 token（逐字流式）
+    - done         完成
+    - error        出错
+    """
+    import services.agent_service as agent_service
+
+    async def event_generator():
+        yield agent_service.sse_event("meta", {
+            "question": body.question,
+            "document_ids": body.document_ids,
+            "mode": "agent",
+        })
+
+        async for sse_data in agent_service.run_agent_stream(
+            db=db,
+            question=body.question,
+            document_ids=body.document_ids,
+        ):
+            yield sse_data
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/documents", response_model=DocumentListResponse)  # 查询标准文件接口
 async def get_documents(filename: str | None = Query(None),standard_type: str | None = Query(None),
                         industry: str | None = Query(None),tag: str | None = Query(None),page: int = Query(1, ge=1),
@@ -780,7 +823,7 @@ def draft_check(document_id: int, req: AskQuestion, db: Session = Depends(get_db
         db, req.question, req.limit, document_ids=other_ids
     )
     expanded = services.document_service.expand_search_results(db, results, depth=1)
-    refs = _build_references(db, results, expanded)
+    refs = services.document_service.build_references(db, results, expanded)
     ctx = services.document_service._format_comparison_context(refs)
 
     # 获取草案条款详情

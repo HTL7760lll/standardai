@@ -263,3 +263,55 @@ def generate_comparison_answer_stream(question: str, context: str, references: l
         temperature=0.3,
         stream=True,
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# Agent — Tool Calling 支持
+# ═══════════════════════════════════════════════════════════════
+
+def generate_agent_response(
+    messages: list[ChatCompletionMessageParam],
+    tools: list[dict],
+    model: str | None = None,
+):
+    """非流式，带 tools 参数。返回完整 ChatCompletion 对象。"""
+    return client.chat.completions.create(
+        model=model or settings.DEEPSEEK_MODEL,
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        temperature=0.2,
+    )
+
+
+def generate_agent_response_stream(
+    messages: list[ChatCompletionMessageParam],
+    tools: list[dict],
+    model: str | None = None,
+):
+    """流式，带 tools 参数。返回 Stream 对象，调用方迭代获取 delta。"""
+    return client.chat.completions.create(
+        model=model or settings.DEEPSEEK_MODEL,
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        temperature=0.2,
+        stream=True,
+    )
+
+
+def generate_answer_from_messages(
+    messages: list[ChatCompletionMessageParam],
+) -> str:
+    """从累积的消息历史生成最终回答（agent 兜底用）"""
+    try:
+        response = client.chat.completions.create(
+            model=settings.DEEPSEEK_MODEL,
+            messages=messages,
+            temperature=0.2,
+        )
+        if response.choices:
+            return response.choices[0].message.content or ""
+        return ""
+    except Exception as e:
+        return f"模型调用失败: {e}"
