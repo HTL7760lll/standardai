@@ -1974,8 +1974,14 @@ def save_document_chunk(db, chunks, document_id: int):
                 # parent_chunk_index 是临时索引，需要在全部保存后换算为实际 ID
                 parent_chunk_id = None  # 第二轮赋值
 
-            embedding = services.embedding_service.generate_embedding(content)
-            embedding_json = services.embedding_service.embedding_to_json(embedding)
+            try:
+                embedding = services.embedding_service.generate_embedding(content)
+                embedding_json = services.embedding_service.embedding_to_json(embedding)
+            except (UnboundLocalError, TypeError, Exception) as e:
+                logger.warning(f"chunk #{index} embedding 失败（tokenizer bug），使用零向量: {e}")
+                # 384 维零向量兜底
+                embedding = [0.0] * 384
+                embedding_json = "[" + ",".join(["0.0"] * 384) + "]"
             logger.debug(f"chunk #{index} doc={document_id} len={len(content)} type={chunk_type} path={section_path}")
             chunk_record = DocumentChunk(
                 document_id=document_id,
