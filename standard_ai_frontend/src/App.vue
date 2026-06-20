@@ -95,6 +95,45 @@
               {{ msg.refsCount ? '已检索到 ' + msg.refsCount + ' 条参考，' : '' }}AI 正在生成回答...
             </div>
 
+            <!-- Agent 思考过程 -->
+            <div v-if="msg.role === 'ai' && msg.toolCalls && msg.toolCalls.length" class="agent-process">
+              <el-collapse>
+                <el-collapse-item>
+                  <template #title>
+                    <div class="agent-process-title">
+                      🤖 Agent 思考过程
+                      <el-tag size="small" :type="msg.streaming ? 'warning' : 'success'" style="margin-left:8px;">
+                        {{ msg.toolCalls.length }} 步 {{ msg.streaming ? '进行中' : '完成' }}
+                      </el-tag>
+                    </div>
+                  </template>
+                  <div class="agent-timeline">
+                    <div v-for="(tc, ti) in msg.toolCalls" :key="ti" class="agent-step">
+                      <div class="agent-step-icon">
+                        <span v-if="tc.status === 'done'">✅</span>
+                        <span v-else-if="tc.status === 'executing'">⏳</span>
+                        <span v-else>🔍</span>
+                      </div>
+                      <div class="agent-step-body">
+                        <div class="agent-step-name">
+                          {{ toolNameLabel(tc.name) }}
+                          <el-tag size="small" v-if="tc.name === 'search_standards' && tc.arguments" style="margin-left:6px;">
+                            {{ toolArgsSummary(tc) }}
+                          </el-tag>
+                        </div>
+                        <div class="agent-step-result" v-if="tc.status === 'done' && tc.resultPreview">
+                          {{ toolResultSummary(tc) }}
+                        </div>
+                        <div class="agent-step-loading" v-else-if="tc.status !== 'done'">
+                          <span class="streaming-dot"></span> 执行中...
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </el-collapse-item>
+              </el-collapse>
+            </div>
+
             <!-- 错误重试 -->
             <div v-if="msg.role === 'ai' && msg.isError && !msg.streaming" style="margin-top:6px;">
               <el-button size="small" type="warning" text @click="retryAsk(msg)">🔄 重新生成</el-button>
@@ -213,6 +252,15 @@
                 <el-select v-model="askDocIds" placeholder="选择标准（可多选对比）" clearable multiple size="small" style="width: 280px;" :multiple-limit="5" collapse-tags>
                   <el-option v-for="doc in allDocuments" :key="doc.id" :label="doc.filename" :value="doc.id" />
                 </el-select>
+              </el-tooltip>
+              <el-tooltip :content="agentMode ? 'Agent模式：AI将主动多次搜索、对比、查条款全文（慢但深入）' : '标准模式：单次检索快速回答（快）'" placement="top">
+                <el-switch
+                  v-model="agentMode"
+                  active-text="🤖 Agent"
+                  inactive-text="📋 标准"
+                  size="small"
+                  style="margin-left:12px;"
+                />
               </el-tooltip>
             </div>
             <el-button text size="small" @click="clearChat" :disabled="chatHistory.length === 0">清空对话</el-button>
@@ -462,7 +510,7 @@
 import { onMounted, reactive, ref, nextTick, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { UploadFilled, Upload, Search, User, Lock } from '@element-plus/icons-vue'
-import { askQuestion, askStream, generateChunks, getDocuments, uploadDocument, analyzeDocument, getDocumentStats, searchDocuments, deleteDocument, createAnnotation, getClauses, draftCheck, getCitationGraph, login, register } from './services/api'
+import { askQuestion, askStream, askAgentStream, generateChunks, getDocuments, uploadDocument, analyzeDocument, getDocumentStats, searchDocuments, deleteDocument, createAnnotation, getClauses, draftCheck, getCitationGraph, login, register } from './services/api'
 import { marked } from 'marked'
 import * as echarts from 'echarts'
 
@@ -556,6 +604,7 @@ const question = ref('')
 const limit = ref(5)
 const asking = ref(false)
 const askDocIds = ref([])
+const agentMode = ref(false)  // Agent 工具调用模式
 
 // ── 切片 ──
 const chunkLoadingId = ref(null)
@@ -834,7 +883,7 @@ async function submitAsk() {
   chatHistory.value.push({ role: 'user', content: q })
 
   // 创建 AI 消息占位，标记为流式中
-  const aiMsg = { role: 'ai', content: '', references: [], followUps: [], recommendations: null, streaming: true }
+  const aiMsg = { role: 'ai', content: '', references: [], followUps: [], recommendations: null, streaming: true, toolCalls: [], agentMode: agentMode.value }
   chatHistory.value.push(aiMsg)
 
   const scrollToBottom = () => {
@@ -845,7 +894,8 @@ async function submitAsk() {
 
   try {
     const payload = { question: q, limit: limit.value, document_ids: askDocIds.value.length ? askDocIds.value : null }
-    for await (const event of askStream(payload)) {
+    const streamFn = agentMode.value ? askAgentStream : askStream
+    for await (const event of streamFn(payload)) {
       if (event.type === 'token') {
         aiMsg.content += event.content
         scrollToBottom()
@@ -856,6 +906,7 @@ async function submitAsk() {
         aiMsg.isComparison = event.is_comparison || false
         aiMsg.comparisonCount = event.comparison_count || 0
         aiMsg.refsCount = (event.references || []).length
+        aiMsg.agentMode = event.mode === 'agent'
         if (event.auto_matched_document) {
           askDocIds.value = [event.auto_matched_document.document_id]
           aiMsg.autoMatched = event.auto_matched_document
@@ -863,8 +914,29 @@ async function submitAsk() {
         if (event.auto_match_fallback) {
           aiMsg.autoMatchFallback = true
         }
+      } else if (event.type === 'tool_call') {
+        // Agent 工具调用开始
+        aiMsg.toolCalls.push({
+          name: event.name,
+          arguments: event.arguments,
+          status: 'calling',
+          resultPreview: '',
+        })
+        scrollToBottom()
+      } else if (event.type === 'tool_status') {
+        // Agent 工具执行中
+        const tc = aiMsg.toolCalls.find(t => t.name === event.name && t.status === 'calling')
+        if (tc) tc.status = 'executing'
+        scrollToBottom()
+      } else if (event.type === 'tool_result') {
+        // Agent 工具返回结果
+        const tc = aiMsg.toolCalls.find(t => t.name === event.name && (t.status === 'executing' || t.status === 'calling'))
+        if (tc) {
+          tc.status = 'done'
+          tc.resultPreview = event.result_preview || ''
+        }
+        scrollToBottom()
       } else if (event.type === 'answer') {
-        // 无参考资料时的兜底回答
         aiMsg.content = event.content
       } else if (event.type === 'done') {
         aiMsg.streaming = false
@@ -936,6 +1008,58 @@ function groupedRefs(refs) {
     groups[key].refs.push(r)
   }
   return Object.values(groups)
+}
+
+// ── Agent 思考过程辅助 ──
+const TOOL_LABELS = {
+  search_standards: '🔍 搜索标准',
+  get_clause_content: '📄 获取条款',
+  list_available_standards: '📋 列出标准',
+  expand_chunk_context: '📂 展开上下文',
+  check_conflict: '⚖️ 检查冲突',
+}
+
+function toolNameLabel(name) {
+  return TOOL_LABELS[name] || name
+}
+
+function toolArgsSummary(tc) {
+  try {
+    const args = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments
+    if (tc.name === 'search_standards' && args.query) {
+      return `"${args.query.substring(0, 40)}"` + (args.document_ids?.length ? ` (文档${args.document_ids.join(',')})` : '')
+    }
+    if (tc.name === 'get_clause_content' && args.clause_number) {
+      return `条款 ${args.clause_number}` + (args.document_id ? ` (文档${args.document_id})` : '')
+    }
+    if (tc.name === 'check_conflict') {
+      return args.clause_text?.substring(0, 30) + '...' || ''
+    }
+    return ''
+  } catch { return '' }
+}
+
+function toolResultSummary(tc) {
+  try {
+    const r = typeof tc.resultPreview === 'string' ? JSON.parse(tc.resultPreview) : tc.resultPreview
+    if (tc.name === 'list_available_standards') {
+      return `共 ${r.total || 0} 份标准可用`
+    }
+    if (tc.name === 'search_standards') {
+      return `${r.confidence || ''} 置信度，找到 ${r.total_results || 0} 条结果`
+    }
+    if (tc.name === 'get_clause_content') {
+      if (!r.found) return '未找到该条款'
+      return `找到 ${r.clauses?.length || 0} 条条款内容`
+    }
+    if (tc.name === 'expand_chunk_context') {
+      return `展开上下文，共 ${r.total_results || 0} 条`
+    }
+    if (tc.name === 'check_conflict') {
+      return `冲突检查完成，${r.total_results || 0} 条可能相关`
+    }
+    return (tc.resultPreview || '').substring(0, 80)
+  } catch { return (tc.resultPreview || '').substring(0, 80) }
 }
 
 // ── 窗口缩放时重绘饼图 ──
