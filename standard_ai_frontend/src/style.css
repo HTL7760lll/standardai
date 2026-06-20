@@ -126,6 +126,8 @@ body {
 
 /* Markdown 渲染样式 */
 .markdown-body { line-height: 1.9; }
+.markdown-body p { margin: 4px 0; }
+.markdown-body p:empty { display: none; }
 .markdown-body h2 { font-size: 17px; margin: 14px 0 6px; color: #1a3a5c; border-bottom: 1px solid #e4e7ed; padding-bottom: 4px; }
 .markdown-body h3 { font-size: 15px; margin: 12px 0 4px; color: #2d6aa0; }
 .markdown-body table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 13px; }

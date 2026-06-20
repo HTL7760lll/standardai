@@ -647,8 +647,10 @@ let industryChart = null
 // ── Markdown 渲染 ──
 function renderMarkdown(text) {
   if (!text) return ''
-  // 合并多余空行：3+ 换行 → 2 换行（标准 markdown 段落间距）
-  const clean = text.replace(/\n{3,}/g, '\n\n')
+  // 去首尾 + 把含不可见字符的空行规范化 + 2+连续空行压缩为1个空行
+  let clean = text.trim()
+  clean = clean.replace(/^[ \t\r]+$/gm, '')
+  clean = clean.replace(/\n{3,}/g, '\n\n')
   return marked(clean, { breaks: false, gfm: true })
 }
 
