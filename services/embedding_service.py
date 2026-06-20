@@ -63,6 +63,14 @@ def generate_embedding(text: str) -> list[float]:
         model = get_model()
         embedding = model.encode(_clean_text(text))
         return embedding.tolist()
+    except (UnboundLocalError, TypeError) as e:
+        # tokenizer 内部 BUG：某些字符导致静默失败
+        # 降级：用纯 ASCII 清洗后再试
+        print(f"[Embedding] tokenizer 异常，降级清洗后重试: {e}", file=sys.stderr)
+        import re
+        fallback = re.sub(r'[^\x20-\x7e一-鿿\n]', ' ', text)  # 只保留 ASCII+中文+换行
+        embedding = model.encode(fallback)
+        return embedding.tolist()
     except Exception as e:
         print(f"[Embedding] 生成 embedding 失败: {e}", file=sys.stderr)
         raise
@@ -71,9 +79,14 @@ def generate_embedding(text: str) -> list[float]:
 def _clean_text(text: str) -> str:
     """清洗 OCR 乱码字符，防止 tokenizer 崩溃"""
     import re
+    # null 和行尾符
     text = text.replace("\x00", "").replace("\r", "\n")
+    # PDF 字形 ID（/G21 /G2A 等）
     text = re.sub(r'[/Gg][0-9A-Fa-f]{1,3}', ' ', text)
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
+    # 所有控制字符（除了换行和制表符）
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+    # 非 ASCII 但也不是中文/日韩/常用字符的 → 去掉
+    text = re.sub(r'[^\x20-\x7e一-鿿　-〿＀-￯\n]', ' ', text)
     return text
 
 
