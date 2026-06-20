@@ -72,13 +72,18 @@ def rerank(question: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
     pairs = []
     for item in candidates:
         content = item["chunk"].content or ""
-        # 取前 500 字，平衡速度和上下文
-        pairs.append([question, content[:500]])
+        # 截断 + 清理不可见字符，避免 tokenizer 崩溃
+        clean = content[:500].replace("\x00", "").replace("\r", "\n")
+        pairs.append([question.strip(), clean.strip()])
 
     # 批量打分
-    raw_scores = model.predict(pairs, show_progress_bar=False)
+    try:
+        raw_scores = model.predict(pairs, show_progress_bar=False)
+    except Exception as e:
+        logger.warning(f"精排打分失败，跳过重排序: {e}")
+        return candidates[:top_k]
 
-    # Sigmoid归一化到 0-1（CrossEncoder 原始输出是无界 logits）
+    # Sigmoid归一化到 0-1
     import math
     scores = [1.0 / (1.0 + math.exp(-s)) for s in raw_scores]
 
@@ -108,8 +113,8 @@ def check_faithfulness(answer: str, chunks: list[str]) -> dict:
     if not sentences:
         return {"score": 1.0, "flagged": []}
 
-    # 合并原文为一段
-    context = " ".join([c[:300] for c in chunks[:5]])
+    # 合并原文为一段（清理不可见字符）
+    context = " ".join([c[:300].replace("\x00", "").replace("\r", "\n") for c in chunks[:5]])
 
     try:
         model = get_reranker()
@@ -122,8 +127,13 @@ def check_faithfulness(answer: str, chunks: list[str]) -> dict:
     for sent in sentences:
         # 每句 vs 原文，用 CrossEncoder 打分
         import math
-        raw = float(model.predict([[sent, context]], show_progress_bar=False)[0])
-        score = 1.0 / (1.0 + math.exp(-raw))  # sigmoid 归一化到 0-1
+        clean_sent = sent.strip().replace("\x00", "")
+        clean_ctx = context.strip()
+        try:
+            raw = float(model.predict([[clean_sent, clean_ctx]], show_progress_bar=False)[0])
+            score = 1.0 / (1.0 + math.exp(-raw))
+        except Exception:
+            continue  # 跳过无法打分的句子
 
         is_supported = score >= 0.5  # 大于 0.5 表示有依据
 
