@@ -253,15 +253,16 @@
                   <el-option v-for="doc in allDocuments" :key="doc.id" :label="doc.filename" :value="doc.id" />
                 </el-select>
               </el-tooltip>
-              <el-tooltip :content="agentMode ? 'Agent模式：AI将主动多次搜索、对比、查条款全文（慢但深入）' : '标准模式：单次检索快速回答（快）'" placement="top">
-                <el-switch
-                  v-model="agentMode"
-                  active-text="🤖 Agent"
-                  inactive-text="📋 标准"
-                  size="small"
-                  style="margin-left:12px;"
-                />
-              </el-tooltip>
+              <div class="mode-toggle" @click="agentMode = !agentMode">
+                <div :class="['mode-option', { active: !agentMode }]">
+                  <span class="mode-icon">📋</span>
+                  <span class="mode-label">标准</span>
+                </div>
+                <div :class="['mode-option', { active: agentMode }]">
+                  <span class="mode-icon">🤖</span>
+                  <span class="mode-label">Agent</span>
+                </div>
+              </div>
             </div>
             <el-button text size="small" @click="clearChat" :disabled="chatHistory.length === 0">清空对话</el-button>
             <el-button type="primary" :loading="asking" @click="submitAsk" class="send-btn">发送</el-button>
