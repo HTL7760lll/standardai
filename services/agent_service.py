@@ -52,6 +52,7 @@ TOOL_DEFINITIONS = [
             "description": (
                 "搜索标准文档中的相关内容。当你需要查找某个术语、条款、要求或概念时使用。"
                 "可以指定在哪些标准文档中搜索，也可以指定搜索焦点来提升精度。"
+                "如果不指定 document_ids，默认在用户已选定的标准文档中搜索。"
             ),
             "parameters": {
                 "type": "object",
@@ -230,14 +231,16 @@ def sse_event(event_type: str, data: dict) -> str:
 # 工具执行分发器
 # ═══════════════════════════════════════════════════════════════
 
-def execute_tool_call(db, tool_name: str, arguments: dict) -> str:
+def execute_tool_call(db, tool_name: str, arguments: dict,
+                      default_document_ids: list[int] | None = None) -> str:
     """
     执行单个工具调用，返回 JSON string 喂给 LLM。
     所有异常在此捕获，返回错误信息而非抛出。
+    default_document_ids: 用户预选的文档范围，search_standards 在 Agent 未指定时自动使用
     """
     try:
         if tool_name == "search_standards":
-            return _exec_search_standards(db, arguments)
+            return _exec_search_standards(db, arguments, default_document_ids)
         elif tool_name == "get_clause_content":
             return _exec_get_clause_content(db, arguments)
         elif tool_name == "list_available_standards":
@@ -253,10 +256,16 @@ def execute_tool_call(db, tool_name: str, arguments: dict) -> str:
         return json.dumps({"error": "工具执行失败: {}".format(str(e))})
 
 
-def _exec_search_standards(db, args: dict) -> str:
+def _exec_search_standards(db, args: dict,
+                           default_document_ids: list[int] | None = None) -> str:
     from services import document_service
     query = args.get("query", "")
-    doc_ids = args.get("document_ids") or None
+    # Agent 显式传的 document_ids 优先；否则回退到用户预选的文档范围
+    doc_ids = args.get("document_ids")
+    if doc_ids is None or (isinstance(doc_ids, list) and len(doc_ids) == 0):
+        doc_ids = default_document_ids
+    elif isinstance(doc_ids, list) and len(doc_ids) > 0:
+        pass  # Agent 显式指定了文档，使用它
     limit = args.get("limit", 5)
     focus = args.get("focus", "general")
 
@@ -375,32 +384,9 @@ def run_agent(
     """
     import services.llm_service as llm_service
 
-    # 如果用户预选了文档，将文档信息注入初始消息
-    user_content = question
-    system_content = system_prompt_override or _AGENT_SYSTEM_PROMPT
-    if document_ids and len(document_ids) > 0:
-        docs = db.query(Document).filter(Document.id.in_(document_ids)).all()
-        logger.info(f"Agent 预选文档 {len(docs)} 份: {[d.filename for d in docs]}")
-        if docs:
-            doc_list = "\n".join([f"- [{d.id}] {d.filename}" for d in docs])
-            doc_ids_str = ",".join([str(d.id) for d in docs])
-            user_content = (
-                f"【用户已选定以下 {len(docs)} 份标准文档，只需在这 {len(docs)} 份中搜索对比】\n"
-                f"{doc_list}\n\n"
-                f"用户问题：{question}\n\n"
-                f"重要提示：用户已明确选定了这 {len(docs)} 份文档（ID: {doc_ids_str}），"
-                f"请直接使用 search_standards 分别搜索这些文档，"
-                f"不要调用 list_available_standards，不要询问用户要查哪份标准。"
-            )
-            # 修改 system prompt，强调不要再列举标准
-            system_content += (
-                f"\n\n【当前会话约束】用户已预选了 {len(docs)} 份文档（ID: {doc_ids_str}），"
-                f"请跳过 list_available_standards，直接用 search_standards 搜索这些文档。"
-            )
-
     messages = [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content},
+        {"role": "system", "content": system_prompt_override or _AGENT_SYSTEM_PROMPT},
+        {"role": "user", "content": question},
     ]
 
     tool_call_log = []
@@ -472,7 +458,8 @@ def run_agent(
                     arguments = {}
 
                 logger.info(f"Agent 执行工具 [{tool_name}] 参数: {json.dumps(arguments, ensure_ascii=False)[:200]}")
-                result = execute_tool_call(db, tool_name, arguments)
+                result = execute_tool_call(db, tool_name, arguments,
+                                          default_document_ids=document_ids)
 
                 tool_call_log.append({
                     "tool": tool_name,
@@ -542,30 +529,9 @@ async def run_agent_stream(
     """
     import services.llm_service as llm_service
 
-    # 如果用户预选了文档，将文档信息注入初始消息
-    user_content = question
-    system_content = _AGENT_SYSTEM_PROMPT
-    if document_ids and len(document_ids) > 0:
-        docs = db.query(Document).filter(Document.id.in_(document_ids)).all()
-        if docs:
-            doc_list = "\n".join([f"- [{d.id}] {d.filename}" for d in docs])
-            doc_ids_str = ",".join([str(d.id) for d in docs])
-            user_content = (
-                f"【用户已选定以下 {len(docs)} 份标准文档，只需在这 {len(docs)} 份中搜索对比】\n"
-                f"{doc_list}\n\n"
-                f"用户问题：{question}\n\n"
-                f"重要提示：用户已明确选定了这 {len(docs)} 份文档（ID: {doc_ids_str}），"
-                f"请直接使用 search_standards 分别搜索这些文档，"
-                f"不要调用 list_available_standards，不要询问用户要查哪份标准。"
-            )
-            system_content += (
-                f"\n\n【当前会话约束】用户已预选了 {len(docs)} 份文档（ID: {doc_ids_str}），"
-                f"请跳过 list_available_standards，直接用 search_standards 搜索这些文档。"
-            )
-
     messages = [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content},
+        {"role": "system", "content": _AGENT_SYSTEM_PROMPT},
+        {"role": "user", "content": question},
     ]
 
     for turn in range(MAX_TURNS):
@@ -661,7 +627,7 @@ async def run_agent_stream(
 
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
-                None, execute_tool_call, db, tc["name"], arguments
+                None, execute_tool_call, db, tc["name"], arguments, document_ids
             )
 
             yield sse_event("tool_result", {
