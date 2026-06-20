@@ -253,15 +253,33 @@
                   <el-option v-for="doc in allDocuments" :key="doc.id" :label="doc.filename" :value="doc.id" />
                 </el-select>
               </el-tooltip>
-              <div class="mode-toggle" @click="agentMode = !agentMode">
-                <div :class="['mode-option', { active: !agentMode }]">
-                  <span class="mode-icon">📋</span>
-                  <span class="mode-label">标准</span>
-                </div>
-                <div :class="['mode-option', { active: agentMode }]">
-                  <span class="mode-icon">🤖</span>
-                  <span class="mode-label">Agent</span>
-                </div>
+              <div class="mode-toggle">
+                <el-tooltip placement="top" :show-after="300">
+                  <template #content>
+                    <div style="text-align:left;line-height:1.6;">
+                      <div style="font-weight:700;margin-bottom:4px;">📋 标准模式</div>
+                      <div>单次检索，快速回答</div>
+                      <div style="color:#909399;font-size:12px;">适合事实查询、条款定位 · 低延迟</div>
+                    </div>
+                  </template>
+                  <div :class="['mode-option', { active: !agentMode }]" @click="agentMode = false">
+                    <span class="mode-icon">📋</span>
+                    <span class="mode-label">标准</span>
+                  </div>
+                </el-tooltip>
+                <el-tooltip placement="top" :show-after="300">
+                  <template #content>
+                    <div style="text-align:left;line-height:1.6;">
+                      <div style="font-weight:700;margin-bottom:4px;">🤖 Agent 模式</div>
+                      <div>AI 自主搜索、换词重试、查条款全文</div>
+                      <div style="color:#909399;font-size:12px;">适合跨标准对比、起草审查、模糊问题</div>
+                    </div>
+                  </template>
+                  <div :class="['mode-option', { active: agentMode }]" @click="agentMode = true">
+                    <span class="mode-icon">🤖</span>
+                    <span class="mode-label">Agent</span>
+                  </div>
+                </el-tooltip>
               </div>
             </div>
             <el-button text size="small" @click="clearChat" :disabled="chatHistory.length === 0">清空对话</el-button>
