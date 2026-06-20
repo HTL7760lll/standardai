@@ -405,7 +405,7 @@ async def ask_stream(request: Request, body: AskQuestion, db: Session = Depends(
     expanded_results = services.document_service.expand_search_results(db, results, depth=1)
 
     # 引用构建
-    references = _build_references(db, results, expanded_results)
+    references = services.document_service.build_references(db, results, expanded_results)
 
     if len(references) == 0:
         async def empty_stream():

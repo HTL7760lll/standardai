@@ -244,7 +244,7 @@ def execute_tool_call(db, tool_name: str, arguments: dict,
         elif tool_name == "get_clause_content":
             return _exec_get_clause_content(db, arguments)
         elif tool_name == "list_available_standards":
-            return _exec_list_standards(db)
+            return _exec_list_standards(db, default_document_ids)
         elif tool_name == "expand_chunk_context":
             return _exec_expand_chunk_context(db, arguments)
         elif tool_name == "check_conflict":
@@ -319,18 +319,24 @@ def _exec_get_clause_content(db, args: dict) -> str:
     }, ensure_ascii=False)
 
 
-def _exec_list_standards(db) -> str:
+def _exec_list_standards(db, default_document_ids: list[int] | None = None) -> str:
+    # 用户预选了文档 → 只返回预选文档，不返回全量
+    if default_document_ids and len(default_document_ids) > 0:
+        docs = db.query(Document).filter(Document.id.in_(default_document_ids)).all()
+        return json.dumps({
+            "total": len(docs),
+            "capped": False,
+            "filtered": True,
+            "standards": [{"id": d.id, "filename": d.filename} for d in docs],
+        }, ensure_ascii=False)
+
+    # 未预选 → 返回全部
     docs = db.query(Document).order_by(Document.id.desc()).limit(30).all()
     return json.dumps({
         "total": len(docs),
         "capped": len(docs) >= 30,
-        "standards": [
-            {
-                "id": d.id,
-                "filename": d.filename,
-            }
-            for d in docs
-        ],
+        "filtered": False,
+        "standards": [{"id": d.id, "filename": d.filename} for d in docs],
     }, ensure_ascii=False)
 
 
@@ -384,9 +390,16 @@ def run_agent(
     """
     import services.llm_service as llm_service
 
+    user_content = question
+    if document_ids and len(document_ids) > 0:
+        docs = db.query(Document).filter(Document.id.in_(document_ids)).all()
+        if docs:
+            doc_list = "\n".join([f"- {d.filename}" for d in docs])
+            user_content = f"用户已选定以下标准文档：\n{doc_list}\n\n用户问题：{question}"
+
     messages = [
         {"role": "system", "content": system_prompt_override or _AGENT_SYSTEM_PROMPT},
-        {"role": "user", "content": question},
+        {"role": "user", "content": user_content},
     ]
 
     tool_call_log = []
@@ -529,9 +542,16 @@ async def run_agent_stream(
     """
     import services.llm_service as llm_service
 
+    user_content = question
+    if document_ids and len(document_ids) > 0:
+        docs = db.query(Document).filter(Document.id.in_(document_ids)).all()
+        if docs:
+            doc_list = "\n".join([f"- {d.filename}" for d in docs])
+            user_content = f"用户已选定以下标准文档：\n{doc_list}\n\n用户问题：{question}"
+
     messages = [
         {"role": "system", "content": _AGENT_SYSTEM_PROMPT},
-        {"role": "user", "content": question},
+        {"role": "user", "content": user_content},
     ]
 
     for turn in range(MAX_TURNS):
