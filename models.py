@@ -85,18 +85,6 @@ class OcrResultCache(Base):
     created_at = Column(DateTime, default=datetime.now)
 
 
-# ── Agent 对话记录 ──
-class Conversation(Base):
-    __tablename__ = "conversations"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=False, index=True)
-    title = Column(String(200), nullable=True)
-    messages = Column(JSON, nullable=False, default=list)
-    created_at = Column(DateTime, default=datetime.now)
-    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-
-
 # ── 用户标注笔记 ──
 class Annotation(Base):
     __tablename__ = "annotations"

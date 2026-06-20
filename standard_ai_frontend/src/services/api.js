@@ -122,55 +122,6 @@ export function getCitationGraph() {
   return api.get('/documents/citations/graph')
 }
 
-/**
- * SSE 流式 Agent 问答（工具调用版）
- * 事件类型比 askStream 多：
- *   { type: 'tool_call', name, arguments, status: 'calling' }
- *   { type: 'tool_status', name, status: 'executing' }
- *   { type: 'tool_result', name, result_preview }
- * 其余同 askStream
- */
-export async function* askAgentStream(payload) {
-  const url = `${baseURL}/ask/agent/stream`
-  const token = localStorage.getItem('token')
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { 'Authorization': 'Bearer ' + token } : {}),
-    },
-    body: JSON.stringify(payload),
-  })
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-  }
-
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop()
-
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (trimmed.startsWith('data: ')) {
-        try {
-          yield JSON.parse(trimmed.slice(6))
-        } catch {
-          // ignore parse errors
-        }
-      }
-    }
-  }
-}
-
 // 认证
 export function login(data) {
   return api.post('/auth/login', data)

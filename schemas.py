@@ -101,18 +101,3 @@ class AskQuestion(BaseModel):
     document_ids: list[int] | None = None  # 支持多标准对比，空=全库
     question: str
     limit: int = 5
-
-
-class AgentToolCall(BaseModel):
-    tool: str
-    arguments: dict
-    result_preview: str
-
-
-class AgentAskResponse(BaseModel):
-    question: str
-    answer: str
-    tool_calls: list[AgentToolCall]
-    references: list[dict]
-    turn_count: int
-    faithfulness: dict | None = None
