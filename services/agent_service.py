@@ -375,9 +375,32 @@ def run_agent(
     """
     import services.llm_service as llm_service
 
+    # 如果用户预选了文档，将文档信息注入初始消息
+    user_content = question
+    system_content = system_prompt_override or _AGENT_SYSTEM_PROMPT
+    if document_ids and len(document_ids) > 0:
+        docs = db.query(Document).filter(Document.id.in_(document_ids)).all()
+        logger.info(f"Agent 预选文档 {len(docs)} 份: {[d.filename for d in docs]}")
+        if docs:
+            doc_list = "\n".join([f"- [{d.id}] {d.filename}" for d in docs])
+            doc_ids_str = ",".join([str(d.id) for d in docs])
+            user_content = (
+                f"【用户已选定以下 {len(docs)} 份标准文档，只需在这 {len(docs)} 份中搜索对比】\n"
+                f"{doc_list}\n\n"
+                f"用户问题：{question}\n\n"
+                f"重要提示：用户已明确选定了这 {len(docs)} 份文档（ID: {doc_ids_str}），"
+                f"请直接使用 search_standards 分别搜索这些文档，"
+                f"不要调用 list_available_standards，不要询问用户要查哪份标准。"
+            )
+            # 修改 system prompt，强调不要再列举标准
+            system_content += (
+                f"\n\n【当前会话约束】用户已预选了 {len(docs)} 份文档（ID: {doc_ids_str}），"
+                f"请跳过 list_available_standards，直接用 search_standards 搜索这些文档。"
+            )
+
     messages = [
-        {"role": "system", "content": system_prompt_override or _AGENT_SYSTEM_PROMPT},
-        {"role": "user", "content": question},
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
     ]
 
     tool_call_log = []
@@ -519,9 +542,30 @@ async def run_agent_stream(
     """
     import services.llm_service as llm_service
 
+    # 如果用户预选了文档，将文档信息注入初始消息
+    user_content = question
+    system_content = _AGENT_SYSTEM_PROMPT
+    if document_ids and len(document_ids) > 0:
+        docs = db.query(Document).filter(Document.id.in_(document_ids)).all()
+        if docs:
+            doc_list = "\n".join([f"- [{d.id}] {d.filename}" for d in docs])
+            doc_ids_str = ",".join([str(d.id) for d in docs])
+            user_content = (
+                f"【用户已选定以下 {len(docs)} 份标准文档，只需在这 {len(docs)} 份中搜索对比】\n"
+                f"{doc_list}\n\n"
+                f"用户问题：{question}\n\n"
+                f"重要提示：用户已明确选定了这 {len(docs)} 份文档（ID: {doc_ids_str}），"
+                f"请直接使用 search_standards 分别搜索这些文档，"
+                f"不要调用 list_available_standards，不要询问用户要查哪份标准。"
+            )
+            system_content += (
+                f"\n\n【当前会话约束】用户已预选了 {len(docs)} 份文档（ID: {doc_ids_str}），"
+                f"请跳过 list_available_standards，直接用 search_standards 搜索这些文档。"
+            )
+
     messages = [
-        {"role": "system", "content": _AGENT_SYSTEM_PROMPT},
-        {"role": "user", "content": question},
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
     ]
 
     for turn in range(MAX_TURNS):
