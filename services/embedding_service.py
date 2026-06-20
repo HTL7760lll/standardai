@@ -61,18 +61,27 @@ def generate_embedding(text: str) -> list[float]:
     """生成文本的向量嵌入（文档文本）"""
     try:
         model = get_model()
-        embedding = model.encode(text)
+        embedding = model.encode(_clean_text(text))
         return embedding.tolist()
     except Exception as e:
         print(f"[Embedding] 生成 embedding 失败: {e}", file=sys.stderr)
         raise
 
 
+def _clean_text(text: str) -> str:
+    """清洗 OCR 乱码字符，防止 tokenizer 崩溃"""
+    import re
+    text = text.replace("\x00", "").replace("\r", "\n")
+    text = re.sub(r'[/Gg][0-9A-Fa-f]{1,3}', ' ', text)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
+    return text
+
+
 def generate_query_embedding(question: str) -> list[float]:
     """生成查询向量（语义检索用）"""
     try:
         model = get_model()
-        embedding = model.encode(question)
+        embedding = model.encode(_clean_text(question))
         return embedding.tolist()
     except Exception as e:
         print(f"[Embedding] 生成查询 embedding 失败: {e}", file=sys.stderr)
@@ -85,7 +94,8 @@ def generate_embeddings_batch(texts: list[str]) -> list[list[float]]:
         return []
     try:
         model = get_model()
-        embeddings = model.encode(texts, batch_size=32, show_progress_bar=False)
+        cleaned = [_clean_text(t) for t in texts]
+        embeddings = model.encode(cleaned, batch_size=32, show_progress_bar=False)
         return embeddings.tolist()
     except Exception as e:
         print(f"[Embedding] 批量生成 embedding 失败: {e}", file=sys.stderr)
