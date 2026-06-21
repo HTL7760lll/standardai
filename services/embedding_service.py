@@ -96,6 +96,13 @@ def generate_query_embedding(question: str) -> list[float]:
         model = get_model()
         embedding = model.encode(_clean_text(question))
         return embedding.tolist()
+    except (UnboundLocalError, TypeError) as e:
+        # tokenizer 内部 BUG：某些字符导致静默失败
+        print(f"[Embedding] tokenizer 异常，降级清洗后重试: {e}", file=sys.stderr)
+        import re
+        fallback = re.sub(r'[^\x20-\x7e一-鿿\n]', ' ', question)
+        embedding = model.encode(fallback)
+        return embedding.tolist()
     except Exception as e:
         print(f"[Embedding] 生成查询 embedding 失败: {e}", file=sys.stderr)
         raise
@@ -109,6 +116,13 @@ def generate_embeddings_batch(texts: list[str]) -> list[list[float]]:
         model = get_model()
         cleaned = [_clean_text(t) for t in texts]
         embeddings = model.encode(cleaned, batch_size=32, show_progress_bar=False)
+        return embeddings.tolist()
+    except (UnboundLocalError, TypeError) as e:
+        # tokenizer 内部 BUG：某些字符导致静默失败
+        print(f"[Embedding] tokenizer 异常，降级清洗后重试: {e}", file=sys.stderr)
+        import re
+        fallback = [re.sub(r'[^\x20-\x7e一-鿿\n]', ' ', t) for t in texts]
+        embeddings = model.encode(fallback, batch_size=32, show_progress_bar=False)
         return embeddings.tolist()
     except Exception as e:
         print(f"[Embedding] 批量生成 embedding 失败: {e}", file=sys.stderr)
