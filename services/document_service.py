@@ -1979,9 +1979,9 @@ def save_document_chunk(db, chunks, document_id: int):
                 embedding_json = services.embedding_service.embedding_to_json(embedding)
             except (UnboundLocalError, TypeError, Exception) as e:
                 logger.warning(f"chunk #{index} embedding 失败（tokenizer bug），使用零向量: {e}")
-                # 384 维零向量兜底
-                embedding = [0.0] * 384
-                embedding_json = "[" + ",".join(["0.0"] * 384) + "]"
+                dim = services.embedding_service._get_embedding_dim()
+                embedding = [0.0] * dim
+                embedding_json = "[" + ",".join(["0.0"] * dim) + "]"
             logger.debug(f"chunk #{index} doc={document_id} len={len(content)} type={chunk_type} path={section_path}")
             chunk_record = DocumentChunk(
                 document_id=document_id,

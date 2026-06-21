@@ -10,8 +10,19 @@ _model = None
 _model_load_error = None
 
 EMBEDDING_MODEL_NAME = settings.EMBEDDING_MODEL
+EMBEDDING_DIM = 384  # paraphrase-multilingual-MiniLM-L12-v2 的维度
 # BGE 模型检索任务 instruction 前缀（仅 BGE 模型使用）
 BGE_RETRIEVAL_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+
+def _get_embedding_dim() -> int:
+    """获取当前模型的 embedding 维度"""
+    global EMBEDDING_DIM
+    try:
+        m = get_model()
+        EMBEDDING_DIM = m.get_sentence_embedding_dimension()
+    except Exception:
+        pass
+    return EMBEDDING_DIM
 
 
 def get_model():
@@ -77,7 +88,7 @@ def generate_embedding(text: str) -> list[float]:
         except Exception:
             # 最终兜底：返回零向量，不阻塞流程
             print(f"[Embedding] 降级清洗也失败，使用零向量", file=sys.stderr)
-            return [0.0] * 1024
+            return [0.0] * _get_embedding_dim()
     except Exception as e:
         print(f"[Embedding] 生成 embedding 失败: {e}", file=sys.stderr)
         raise
@@ -114,7 +125,7 @@ def generate_query_embedding(question: str) -> list[float]:
             return embedding.tolist()
         except Exception:
             print(f"[Embedding] 降级清洗也失败，使用零向量", file=sys.stderr)
-            return [0.0] * 1024
+            return [0.0] * _get_embedding_dim()
     except Exception as e:
         print(f"[Embedding] 生成查询 embedding 失败: {e}", file=sys.stderr)
         raise
@@ -138,7 +149,7 @@ def generate_embeddings_batch(texts: list[str]) -> list[list[float]]:
             return embeddings.tolist()
         except Exception:
             print(f"[Embedding] 降级清洗也失败，使用零向量", file=sys.stderr)
-            return [[0.0] * 1024 for _ in texts]
+            return [[0.0] * _get_embedding_dim() for _ in texts]
     except Exception as e:
         print(f"[Embedding] 批量生成 embedding 失败: {e}", file=sys.stderr)
         raise
