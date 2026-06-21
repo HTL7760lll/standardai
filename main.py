@@ -54,8 +54,25 @@ def health_check():
 
 
 @app.on_event("startup")
-def build_vector_index():
-    """启动时构建 faiss 向量索引"""
+def startup():
+    """启动时预加载模型 + 构建 faiss 向量索引"""
+    # 1. 预加载 embedding 模型（含预热，确保 tokenizer 完全就绪）
+    try:
+        from services import embedding_service
+        embedding_service.get_model()
+        logger.info("embedding 模型已预加载")
+    except Exception as e:
+        logger.warning(f"embedding 模型预加载失败（首次请求将重试）: {e}")
+
+    # 2. 预加载重排序模型
+    try:
+        import services.reranker as reranker
+        reranker.get_reranker()
+        logger.info("重排序模型已预加载")
+    except Exception as e:
+        logger.warning(f"重排序模型预加载失败（首次请求将重试）: {e}")
+
+    # 3. 构建 faiss 向量索引
     try:
         from database import SessionLocal
         import services.vector_index as vi

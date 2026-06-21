@@ -4,10 +4,13 @@ import sys
 from config import settings
 from sentence_transformers import SentenceTransformer
 
+import threading
+
 os.environ["HF_ENDPOINT"] = settings.HF_ENDPOINT
 
 _model = None
 _model_load_error = None
+_init_lock = threading.Lock()
 
 EMBEDDING_MODEL_NAME = settings.EMBEDDING_MODEL
 EMBEDDING_DIM = 384  # paraphrase-multilingual-MiniLM-L12-v2 的维度
@@ -26,46 +29,58 @@ def _get_embedding_dim() -> int:
 
 
 def get_model():
-    """获取 embedding 模型实例，带异常处理和自动重试"""
+    """获取 embedding 模型实例（线程安全 + 启动预热 + 重试）"""
     global _model, _model_load_error
 
     if _model is not None:
         return _model
 
-    if _model_load_error is not None:
-        # 不清除错误缓存，避免每次请求都重试下载（消耗网络和 CPU）
-        raise _model_load_error
-
-    import time
-    max_retries = 3
-    last_error = None
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            print(f"[Embedding] 正在加载模型 {EMBEDDING_MODEL_NAME}（尝试 {attempt}/{max_retries}）...")
-            # 优先从本地缓存加载，避免 SSL/网络问题
-            try:
-                _model = SentenceTransformer(EMBEDDING_MODEL_NAME, local_files_only=True)
-                print("[Embedding] 从本地缓存加载模型")
-            except Exception:
-                print("[Embedding] 本地缓存未命中，尝试从网络下载...")
-                print("[Embedding] 下载源: https://hf-mirror.com")
-                _model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-            _model_load_error = None  # 成功后清除错误
-            print(f"[Embedding] 模型加载完成！最大序列长度: {_model.max_seq_length}")
+    with _init_lock:
+        # 双重检查：锁内再次确认
+        if _model is not None:
             return _model
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries:
-                wait = 5 * attempt
-                print(f"[Embedding] 加载失败（{e}），{wait}秒后重试...")
-                time.sleep(wait)
 
-    _model_load_error = RuntimeError(
-        f"Embedding 模型加载失败（重试{max_retries}次）: {last_error}\n"
-        "请检查网络连接，或尝试手动下载模型放置到本地。"
-    )
-    raise _model_load_error
+        if _model_load_error is not None:
+            raise _model_load_error
+
+        import time
+        max_retries = 3
+        last_error = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"[Embedding] 正在加载模型 {EMBEDDING_MODEL_NAME}（尝试 {attempt}/{max_retries}）...")
+                try:
+                    _model = SentenceTransformer(EMBEDDING_MODEL_NAME, local_files_only=True)
+                    print("[Embedding] 从本地缓存加载模型")
+                except Exception:
+                    print("[Embedding] 本地缓存未命中，尝试从网络下载...")
+                    print("[Embedding] 下载源: https://hf-mirror.com")
+                    _model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+                _model_load_error = None
+                print(f"[Embedding] 模型加载完成！最大序列长度: {_model.max_seq_length}")
+
+                # 预热：确保 tokenizer processor 完全初始化
+                try:
+                    _model.encode("预热")
+                    print("[Embedding] 模型预热完成，tokenizer 就绪")
+                except Exception:
+                    pass
+
+                return _model
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    wait = 5 * attempt
+                    print(f"[Embedding] 加载失败（{e}），{wait}秒后重试...")
+                    time.sleep(wait)
+
+        _model_load_error = RuntimeError(
+            f"Embedding 模型加载失败（重试{max_retries}次）: {last_error}\n"
+            "请检查网络连接，或尝试手动下载模型放置到本地。"
+        )
+        raise _model_load_error
 
 
 def generate_embedding(text: str) -> list[float]:

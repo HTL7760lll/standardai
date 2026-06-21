@@ -2,12 +2,14 @@
 CrossEncoder 重排序 — 对检索候选结果精排，提升 top-k 准确率
 """
 import os
+import threading
 from pathlib import Path
 from logging_config import get_logger
 
 logger = get_logger(__name__)
 
 _model = None
+_init_lock = threading.Lock()
 MODEL_NAME = "BAAI/bge-reranker-base"
 LOCAL_DIR = Path(__file__).parent.parent / "models" / "bge-reranker-base"
 
@@ -29,10 +31,15 @@ def _download_model():
 
 
 def get_reranker():
-    """懒加载 CrossEncoder 模型（优先本地文件）"""
+    """线程安全懒加载 CrossEncoder 模型（优先本地文件）"""
     global _model
-    if _model is None:
-        # 手动下载到本地
+    if _model is not None:
+        return _model
+
+    with _init_lock:
+        if _model is not None:
+            return _model
+
         try:
             _download_model()
         except Exception as e:
@@ -44,7 +51,6 @@ def get_reranker():
             logger.info(f"从本地加载重排序模型: {LOCAL_DIR}")
             _model = CrossEncoder(str(LOCAL_DIR), max_length=512)
         else:
-            # 兜底：联网下载
             logger.info(f"本地模型不存在，联网加载 {MODEL_NAME}...")
             os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
             _model = CrossEncoder(MODEL_NAME, max_length=512)
