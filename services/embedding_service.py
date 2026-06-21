@@ -65,12 +65,19 @@ def generate_embedding(text: str) -> list[float]:
         return embedding.tolist()
     except (UnboundLocalError, TypeError) as e:
         # tokenizer 内部 BUG：某些字符导致静默失败
-        # 降级：用纯 ASCII 清洗后再试
+        # 降级：纯 ASCII+中文清洗后再试
         print(f"[Embedding] tokenizer 异常，降级清洗后重试: {e}", file=sys.stderr)
-        import re
-        fallback = re.sub(r'[^\x20-\x7e一-鿿\n]', ' ', text)  # 只保留 ASCII+中文+换行
-        embedding = model.encode(fallback)
-        return embedding.tolist()
+        try:
+            import re
+            fallback = re.sub(r'[^\x20-\x7e一-鿿\n]', ' ', text)
+            if not fallback.strip():
+                raise ValueError("清洗后文本为空")
+            embedding = model.encode(fallback)
+            return embedding.tolist()
+        except Exception:
+            # 最终兜底：返回零向量，不阻塞流程
+            print(f"[Embedding] 降级清洗也失败，使用零向量", file=sys.stderr)
+            return [0.0] * 1024
     except Exception as e:
         print(f"[Embedding] 生成 embedding 失败: {e}", file=sys.stderr)
         raise
@@ -97,12 +104,17 @@ def generate_query_embedding(question: str) -> list[float]:
         embedding = model.encode(_clean_text(question))
         return embedding.tolist()
     except (UnboundLocalError, TypeError) as e:
-        # tokenizer 内部 BUG：某些字符导致静默失败
         print(f"[Embedding] tokenizer 异常，降级清洗后重试: {e}", file=sys.stderr)
-        import re
-        fallback = re.sub(r'[^\x20-\x7e一-鿿\n]', ' ', question)
-        embedding = model.encode(fallback)
-        return embedding.tolist()
+        try:
+            import re
+            fallback = re.sub(r'[^\x20-\x7e一-鿿\n]', ' ', question)
+            if not fallback.strip():
+                raise ValueError("清洗后文本为空")
+            embedding = model.encode(fallback)
+            return embedding.tolist()
+        except Exception:
+            print(f"[Embedding] 降级清洗也失败，使用零向量", file=sys.stderr)
+            return [0.0] * 1024
     except Exception as e:
         print(f"[Embedding] 生成查询 embedding 失败: {e}", file=sys.stderr)
         raise
@@ -118,12 +130,15 @@ def generate_embeddings_batch(texts: list[str]) -> list[list[float]]:
         embeddings = model.encode(cleaned, batch_size=32, show_progress_bar=False)
         return embeddings.tolist()
     except (UnboundLocalError, TypeError) as e:
-        # tokenizer 内部 BUG：某些字符导致静默失败
         print(f"[Embedding] tokenizer 异常，降级清洗后重试: {e}", file=sys.stderr)
-        import re
-        fallback = [re.sub(r'[^\x20-\x7e一-鿿\n]', ' ', t) for t in texts]
-        embeddings = model.encode(fallback, batch_size=32, show_progress_bar=False)
-        return embeddings.tolist()
+        try:
+            import re
+            fallback = [re.sub(r'[^\x20-\x7e一-鿿\n]', ' ', t) for t in texts]
+            embeddings = model.encode(fallback, batch_size=32, show_progress_bar=False)
+            return embeddings.tolist()
+        except Exception:
+            print(f"[Embedding] 降级清洗也失败，使用零向量", file=sys.stderr)
+            return [[0.0] * 1024 for _ in texts]
     except Exception as e:
         print(f"[Embedding] 批量生成 embedding 失败: {e}", file=sys.stderr)
         raise
